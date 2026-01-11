@@ -37,6 +37,7 @@ class PlateData:
     velocity_vector: Optional[np.ndarray] = None
     rotation_pole: Optional["pygplates.FiniteRotation"] = None
     crust_type: Optional[CrustType] = None
+    continent_polygon: Optional[MultiPolygon] = None
     feature: Optional["pygplates.Feature"] = None
 
 
@@ -935,3 +936,395 @@ class PlateManager:
     def get_feature_collection(self) -> pygplates.FeatureCollection:
         """Get the pygplates FeatureCollection."""
         return self.feature_collection
+
+    # =========================================================================
+    # CONTINENT GENERATION
+    # =========================================================================
+
+    def get_continental_plate_count(self) -> int:
+        """Get the number of continental plates."""
+        return sum(1 for p in self.plates if p.crust_type == CrustType.CONTINENTAL)
+
+    def generate_continents(
+        self,
+        num_continents: int,
+        seed: int,
+        coverage: float = 0.7,
+        ocean_margin: float = 0.1,
+    ):
+        """
+        Generate continent landmasses as independent shapes on continental plates.
+
+        Continents are created as blob shapes at random locations, then clipped
+        to only appear on continental plates (plus optional ocean margin).
+
+        Args:
+            num_continents: Desired number of continents
+            seed: Random seed for generation
+            coverage: Target fraction of continental plate area to cover (0.0 to 1.0)
+            ocean_margin: Fraction continents can extend into oceanic plates (0.0 to 1.0)
+        """
+        rng = random.Random(seed)
+        np.random.seed(seed)
+
+        # Get continental plates and create union of all continental areas
+        continental_plates = [
+            p for p in self.plates if p.crust_type == CrustType.CONTINENTAL
+        ]
+
+        oceanic_plates = [p for p in self.plates if p.crust_type == CrustType.OCEANIC]
+
+        if not continental_plates:
+            print("No continental plates available for continent generation")
+            return
+
+        # Create union of all continental plate boundaries
+        continental_polys = []
+        for plate in continental_plates:
+            if plate.boundary_polygon:
+                for poly in plate.boundary_polygon.geoms:
+                    continental_polys.append(poly)
+
+        if not continental_polys:
+            return
+
+        continental_union = unary_union(continental_polys)
+        continental_area = continental_union.area
+
+        # Create extended clipping region (continental + ocean margin)
+        if ocean_margin > 0 and oceanic_plates:
+            # Buffer continental union outward to create margin into oceanic areas
+            # Estimate buffer distance based on average plate size
+            bounds = continental_union.bounds
+            avg_size = ((bounds[2] - bounds[0]) + (bounds[3] - bounds[1])) / 2
+            buffer_distance = avg_size * ocean_margin * 0.3  # Scale margin
+
+            extended_clip_region = continental_union.buffer(buffer_distance)
+        else:
+            extended_clip_region = continental_union
+
+        # Constrain continent count
+        max_continents = len(continental_plates) * 2
+        num_continents = max(1, min(num_continents, max_continents))
+
+        print(
+            f"Generating {num_continents} continents on {len(continental_plates)} continental plates "
+            f"(coverage={coverage:.0%}, ocean_margin={ocean_margin:.0%})"
+        )
+
+        # Clear existing continents
+        for plate in self.plates:
+            plate.continent_polygon = None
+
+        # Calculate target blob sizes based on coverage
+        # Total area to cover = continental_area * coverage
+        target_total_area = continental_area * coverage
+        avg_blob_area = target_total_area / num_continents
+
+        # Convert area to approximate radius (sqrt of area)
+        # Area in degrees^2, so radius in degrees
+        avg_blob_radius = math.sqrt(avg_blob_area / math.pi)
+
+        # Generate continent blobs as independent shapes
+        continent_shapes = []
+
+        for i in range(num_continents):
+            # Pick random center point within continental area bounds
+            bounds = continental_union.bounds  # (minx, miny, maxx, maxy)
+
+            # Try to place continent within continental area
+            for attempt in range(20):
+                center_lon = rng.uniform(bounds[0], bounds[2])
+                center_lat = rng.uniform(bounds[1], bounds[3])
+                center = Point(center_lon, center_lat)
+
+                # Check if center is on continental plate
+                if continental_union.contains(center):
+                    break
+            else:
+                # Fallback: use centroid of a random continental plate
+                plate = rng.choice(continental_plates)
+                if plate.centroid is not None:
+                    lat, lon = self._cartesian_to_lat_lon(plate.centroid)
+                    center_lon, center_lat = lon, lat
+
+            # Vary blob size around average (first blobs larger, later smaller)
+            size_factor = 1.0 + (0.5 - i / num_continents) * 0.8
+            size_variation = rng.uniform(0.6, 1.4)
+            size = avg_blob_radius * 2 * size_factor * size_variation
+            size = max(8, min(80, size))  # Clamp 8-80 degrees
+
+            # Create organic blob shape
+            blob = self._create_continent_blob(
+                center_lon, center_lat, size, seed + i * 100
+            )
+
+            if blob and not blob.is_empty:
+                continent_shapes.append(blob)
+
+        print(f"Created {len(continent_shapes)} raw continent blobs")
+
+        # Clip all blobs to extended region (continental + ocean margin)
+        for blob in continent_shapes:
+            # Clip to extended region
+            clipped = blob.intersection(extended_clip_region)
+
+            if clipped.is_empty:
+                continue
+
+            # Distribute clipped shape to ALL plates it overlaps (including oceanic for margin)
+            for plate in self.plates:
+                if not plate.boundary_polygon:
+                    continue
+
+                plate_intersection = clipped.intersection(plate.boundary_polygon)
+
+                if plate_intersection.is_empty:
+                    continue
+
+                # Convert to MultiPolygon if needed
+                if isinstance(plate_intersection, Polygon):
+                    plate_intersection = MultiPolygon([plate_intersection])
+                elif not isinstance(plate_intersection, MultiPolygon):
+                    continue
+
+                # Merge with existing continent polygon on this plate
+                if plate.continent_polygon:
+                    merged = unary_union([plate.continent_polygon, plate_intersection])
+                    if isinstance(merged, Polygon):
+                        merged = MultiPolygon([merged])
+                    plate.continent_polygon = merged
+                else:
+                    plate.continent_polygon = plate_intersection
+
+        continents_assigned = sum(
+            1 for p in self.plates if p.continent_polygon is not None
+        )
+        print(f"Assigned continents to {continents_assigned} plates")
+
+    def _create_continent_blob(
+        self, center_lon: float, center_lat: float, size: float, seed: int
+    ) -> Optional[Polygon]:
+        """
+        Create an organic blob shape for a continent.
+
+        Args:
+            center_lon: Longitude of blob center
+            center_lat: Latitude of blob center
+            size: Approximate size in degrees
+            seed: Random seed for shape generation
+
+        Returns:
+            Polygon representing the continent blob
+        """
+        rng = random.Random(seed)
+
+        # Generate blob using polar coordinates with noise
+        num_points = 48
+        coords = []
+
+        for i in range(num_points):
+            angle = 2 * math.pi * i / num_points
+
+            # Base radius with multiple noise octaves for organic shape
+            base_radius = size / 2
+
+            # FBM-style noise for organic coastlines
+            noise = 0.0
+            freq = 1.0
+            amp = 0.4
+            for octave in range(4):
+                phase = seed * 0.1 + octave * 17.3
+                noise += math.sin(angle * freq * 3 + phase) * amp
+                noise += math.cos(angle * freq * 2.3 + phase * 1.7) * amp * 0.5
+                freq *= 2.1
+                amp *= 0.5
+
+            # Add some random variation too
+            noise += (rng.random() - 0.5) * 0.2
+
+            # Stretched ellipse base (more natural continent shapes)
+            stretch_x = 1.0 + rng.random() * 0.5
+            stretch_y = 1.0 + rng.random() * 0.3
+
+            radius = base_radius * (1.0 + noise * 0.6)
+
+            # Calculate point position
+            dx = radius * math.cos(angle) * stretch_x
+            dy = radius * math.sin(angle) * stretch_y
+
+            lon = center_lon + dx
+            lat = center_lat + dy
+
+            # Clamp latitude
+            lat = max(-85, min(85, lat))
+
+            coords.append((lon, lat))
+
+        # Close the polygon
+        coords.append(coords[0])
+
+        blob = Polygon(coords)
+        if not blob.is_valid:
+            blob = blob.buffer(0)
+
+        return blob if not blob.is_empty else None
+
+    def _create_continent_polygon(
+        self, plate: PlateData, coverage: float, seed: int
+    ) -> Optional[MultiPolygon]:
+        """
+        Create a continent polygon within a plate boundary.
+
+        Args:
+            plate: The continental plate
+            coverage: Fraction of plate to cover (0.0 to 1.0)
+            seed: Random seed for coastline noise
+
+        Returns:
+            MultiPolygon representing the continent
+        """
+        if not plate.boundary_polygon:
+            return None
+
+        # Calculate shrink factor based on coverage
+        # coverage ~0.98 -> shrink ~0.01, coverage ~0.85 -> shrink ~0.075
+        # Much smaller margins than before
+        shrink_factor = (1.0 - coverage) * 0.5
+
+        result_polys = []
+
+        for poly in plate.boundary_polygon.geoms:
+            # Shrink the polygon inward
+            shrunk = self._shrink_polygon_with_noise(poly, shrink_factor, seed)
+            if shrunk and not shrunk.is_empty:
+                if isinstance(shrunk, Polygon):
+                    result_polys.append(shrunk)
+                elif isinstance(shrunk, MultiPolygon):
+                    result_polys.extend(shrunk.geoms)
+
+        return MultiPolygon(result_polys) if result_polys else None
+
+    def _create_micro_continent(
+        self, plate: PlateData, coverage: float, seed: int
+    ) -> Optional[MultiPolygon]:
+        """
+        Create a micro-continent (smaller island) within a plate.
+        Places it in a random location within the plate.
+        """
+        if not plate.boundary_polygon:
+            return None
+
+        rng = random.Random(seed)
+
+        # Get the bounds of the plate
+        bounds = plate.boundary_polygon.bounds  # (minx, miny, maxx, maxy)
+
+        # Try to find a valid location
+        for _ in range(10):
+            # Random point within bounds
+            x = rng.uniform(bounds[0], bounds[2])
+            y = rng.uniform(bounds[1], bounds[3])
+            center = Point(x, y)
+
+            if plate.boundary_polygon.contains(center):
+                # Create a small circular-ish shape
+                radius = math.sqrt(coverage) * 15  # Approximate radius in degrees
+
+                # Generate noisy circle
+                coords = []
+                num_points = 24
+                for i in range(num_points):
+                    angle = 2 * math.pi * i / num_points
+                    # Apply noise to radius
+                    noise_val = self._simple_noise(x + i, y + i, seed) * 0.4 + 0.8
+                    r = radius * noise_val
+                    px = x + r * math.cos(angle)
+                    py = y + r * math.sin(angle)
+                    coords.append((px, py))
+                coords.append(coords[0])  # Close
+
+                micro = Polygon(coords)
+                if not micro.is_valid:
+                    micro = micro.buffer(0)
+
+                # Clip to plate boundary
+                clipped = micro.intersection(plate.boundary_polygon)
+                if not clipped.is_empty:
+                    if isinstance(clipped, Polygon):
+                        return MultiPolygon([clipped])
+                    elif isinstance(clipped, MultiPolygon):
+                        return clipped
+
+        return None
+
+    def _shrink_polygon_with_noise(
+        self, poly: Polygon, shrink_factor: float, seed: int
+    ) -> Optional[Polygon]:
+        """
+        Shrink a polygon inward while applying noise for organic coastlines.
+        """
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+
+        # Use negative buffer to shrink
+        # Estimate size to determine buffer amount
+        bounds = poly.bounds
+        width = bounds[2] - bounds[0]
+        height = bounds[3] - bounds[1]
+        avg_size = (width + height) / 2
+
+        buffer_amount = -avg_size * shrink_factor
+
+        shrunk = poly.buffer(buffer_amount, resolution=8)
+
+        if shrunk.is_empty:
+            return None
+
+        # Apply noise to the boundary for organic coastlines
+        if isinstance(shrunk, Polygon):
+            return self._apply_coastline_noise(shrunk, seed)
+        elif isinstance(shrunk, MultiPolygon):
+            noisy_polys = []
+            for p in shrunk.geoms:
+                noisy = self._apply_coastline_noise(p, seed)
+                if noisy and not noisy.is_empty:
+                    noisy_polys.append(noisy)
+            return MultiPolygon(noisy_polys) if noisy_polys else None
+
+        return None
+
+    def _apply_coastline_noise(self, poly: Polygon, seed: int) -> Optional[Polygon]:
+        """
+        Apply organic noise to polygon boundary for realistic coastlines.
+        """
+        coords = list(poly.exterior.coords)
+        noisy_coords = []
+
+        for i, (x, y) in enumerate(coords[:-1]):  # Exclude closing point
+            # Generate noise based on position
+            noise_x = self._simple_noise(x * 5, y * 5, seed) * 2.0
+            noise_y = self._simple_noise(x * 5 + 100, y * 5 + 100, seed) * 2.0
+
+            noisy_coords.append((x + noise_x, y + noise_y))
+
+        if noisy_coords:
+            noisy_coords.append(noisy_coords[0])
+
+        result = Polygon(noisy_coords)
+        if not result.is_valid:
+            result = result.buffer(0)
+
+        return result if not result.is_empty else None
+
+    def _simple_noise(self, x: float, y: float, seed: int) -> float:
+        """
+        Simple deterministic pseudo-noise function.
+        Returns value in range [-1, 1].
+        """
+        # Use sin-based noise for determinism
+        offset = seed * 0.1
+        val = math.sin(x * 1.7 + offset) * math.cos(y * 2.3 + offset)
+        val += math.sin(x * 3.1 + y * 1.9 + offset) * 0.5
+        val += math.cos(x * 0.8 - y * 2.7 + offset) * 0.25
+        return val / 1.75  # Normalize to ~[-1, 1]

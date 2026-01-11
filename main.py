@@ -139,6 +139,7 @@ class TectonicMapGenerator(ShowBase):
             on_toggle_vectors=self.toggle_vector_visibility,
         )
         self.ui_manager.set_classify_crust_callback(self.assign_crust_types)
+        self.ui_manager.set_generate_continents_callback(self.generate_continents)
 
     def _setup_camera(self):
         """Setup camera position and orientation."""
@@ -486,6 +487,41 @@ class TectonicMapGenerator(ShowBase):
     def toggle_vector_visibility(self, visible: bool):
         """Toggle visibility of velocity vectors."""
         self.plate_renderer.set_vectors_visible(visible)
+
+    def generate_continents(
+        self, num_continents: int, coverage: float = 0.7, ocean_margin: float = 0.1
+    ):
+        """Generate continent landmasses on continental plates."""
+        if self._is_generating:
+            return
+
+        # Check if crust types have been assigned
+        continental_count = self.plate_manager.get_continental_plate_count()
+        if continental_count == 0:
+            self.ui_manager.set_status("Error: Classify crust types first!")
+            return
+
+        print(
+            f"Generating {num_continents} continents (coverage={coverage:.0%}, ocean_margin={ocean_margin:.0%})..."
+        )
+
+        # Generate random seed
+        import random
+
+        seed = random.randint(0, 99999)
+
+        # Generate continents with parameters
+        self.plate_manager.generate_continents(
+            num_continents, seed, coverage, ocean_margin
+        )
+
+        # Regenerate texture to show continents
+        self._is_generating = True
+        self.ui_manager.set_generating(True)
+        self.ui_manager.set_status("Generating continents...")
+        self.plate_renderer.start_plate_generation(
+            self.plate_manager.plates, self.plate_manager.get_selected_ids()
+        )
 
 
 def main():

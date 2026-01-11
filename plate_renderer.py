@@ -116,15 +116,20 @@ class PlateTextureGenerator:
 
         plate_id_to_index = {plate.plate_id: i for i, plate in enumerate(plates)}
 
+        # Helper to map lat/lon to pixel coords
+        def to_pixels(lon, lat):
+            # lon: -180 to 180 -> 0 to width
+            x = (lon + 180.0) / 360.0 * self.width
+            # lat: 90 to -90 -> 0 to height (flipped Y)
+            y = (90.0 - lat) / 180.0 * self.height
+            return x, y
+
+        # First pass: Draw all plate backgrounds
         for plate in plates:
             if not plate.boundary_polygon:
                 continue
 
             # Color based on CrustType
-            # Oceanic: Dark Blue (~ #1a2b4b -> 26, 43, 75)
-            # Continental: Land Green/Brown (~ #4b6b3b -> 75, 107, 59)
-            # If unknown, fallback to plate.color
-
             fill_color = (
                 int(plate.color[0] * 255),
                 int(plate.color[1] * 255),
@@ -140,14 +145,6 @@ class PlateTextureGenerator:
             # ID index
             idx = plate_id_to_index.get(plate.plate_id, 255)
 
-            # Helper to map lat/lon to pixel coords
-            def to_pixels(lon, lat):
-                # lon: -180 to 180 -> 0 to width
-                x = (lon + 180.0) / 360.0 * self.width
-                # lat: 90 to -90 -> 0 to height (flipped Y)
-                y = (90.0 - lat) / 180.0 * self.height
-                return x, y
-
             # Draw each polygon in the MultiPolygon
             for poly in plate.boundary_polygon.geoms:
                 # Get exterior coordinates
@@ -156,6 +153,24 @@ class PlateTextureGenerator:
                 # Draw filled polygon
                 draw_color.polygon(pixels, fill=fill_color)
                 draw_id.polygon(pixels, fill=idx)
+
+        # Second pass: Draw continents on top of continental plates
+        continent_fill = (210, 180, 140)  # Tan/Brown for land
+        coastline_color = (101, 67, 33)  # Dark Brown for coastlines
+
+        for plate in plates:
+            if not hasattr(plate, "continent_polygon") or not plate.continent_polygon:
+                continue
+
+            # Draw continent polygons
+            for poly in plate.continent_polygon.geoms:
+                pixels = [to_pixels(*coord) for coord in poly.exterior.coords]
+
+                # Draw filled continent
+                draw_color.polygon(pixels, fill=continent_fill)
+
+                # Draw coastline border
+                draw_color.polygon(pixels, outline=coastline_color)
 
     def cancel(self):
         """Cancel ongoing generation."""

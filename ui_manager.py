@@ -202,6 +202,39 @@ class UIManager:
         s4_height = 0.10
         self._add_section_to_layout(s4_frame, s4_content, s4_height)
 
+        # 5. Continents Section
+        s5_frame, s5_content = self._create_section("Step 5: Continents")
+
+        y_cursor = -0.02
+        self._create_label(s5_content, "Num Continents:", (-0.14 * scale, y_cursor))
+        self._num_continents_entry = self._create_entry(
+            s5_content, "5", (0.04 * scale, y_cursor)
+        )
+
+        y_cursor -= 0.06
+        self._create_label(s5_content, "Coverage %:", (-0.14 * scale, y_cursor))
+        self._coverage_entry = self._create_entry(
+            s5_content, "70", (0.04 * scale, y_cursor)
+        )
+
+        y_cursor -= 0.06
+        self._create_label(s5_content, "Ocean Margin %:", (-0.14 * scale, y_cursor))
+        self._ocean_margin_entry = self._create_entry(
+            s5_content, "10", (0.04 * scale, y_cursor)
+        )
+
+        y_cursor -= 0.07
+
+        self._generate_continents_button = self._create_button(
+            s5_content,
+            "Generate Continents",
+            (0, y_cursor),
+            self._on_generate_continents_clicked,
+        )
+
+        s5_height = 0.32
+        self._add_section_to_layout(s5_frame, s5_content, s5_height)
+
         # --- BOTTOM PANELS ---
         # Fixed area at bottom for status/map
 
@@ -435,6 +468,27 @@ class UIManager:
     def _on_classify_crust_clicked(self):
         if self._on_classify_crust:
             self._on_classify_crust()
+
+    def set_generate_continents_callback(self, callback: Callable):
+        """Set callback for continent generation."""
+        self._on_generate_continents = callback
+
+    def _on_generate_continents_clicked(self):
+        if self._on_generate_continents:
+            try:
+                num_continents = int(self._num_continents_entry.get())
+                coverage = (
+                    int(self._coverage_entry.get()) / 100.0
+                )  # Convert % to fraction
+                ocean_margin = int(self._ocean_margin_entry.get()) / 100.0
+
+                # Clamp values
+                coverage = max(0.1, min(1.0, coverage))
+                ocean_margin = max(0.0, min(0.5, ocean_margin))
+
+                self._on_generate_continents(num_continents, coverage, ocean_margin)
+            except ValueError:
+                self.set_status("Invalid number!")
 
     def _on_toggle_vectors_clicked(self):
         if self._on_toggle_vectors:
