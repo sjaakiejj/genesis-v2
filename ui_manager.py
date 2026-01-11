@@ -48,6 +48,7 @@ class UIManager:
         self._sidebar_bg = None
         self._elements = []
         self._texture_preview: OnscreenImage = None
+        self._reference_preview: OnscreenImage = None
 
         # Callbacks
         self._on_generate: Optional[Callable] = None
@@ -189,8 +190,31 @@ class UIManager:
         )
         self._elements.append(self._preview_frame)
 
+        # --- Reference Map Section ---
+        ref_label = DirectLabel(
+            text="Voronoi Ref:",
+            text_scale=0.035 * scale,
+            text_fg=self.TEXT_COLOR,
+            text_align=TextNode.ACenter,
+            pos=(sidebar_center, 0, -0.02),
+            parent=self.base.aspect2d,
+            frameColor=(0, 0, 0, 0),
+            text_mayChange=False,
+        )
+        self._elements.append(ref_label)
+
+        self._ref_frame = DirectFrame(
+            frameColor=(0.08, 0.08, 0.08, 1),
+            frameSize=(-preview_w, preview_w, -preview_h, preview_h),
+            pos=(sidebar_center, 0, -0.16),
+            parent=self.base.aspect2d,
+        )
+        self._elements.append(self._ref_frame)
+
         self._sidebar_center = sidebar_center
         self._preview_scale = (preview_w, preview_h)
+        self._preview_pos = 0.10
+        self._ref_pos = -0.16
 
         # Status label
         self._status_label = DirectLabel(
@@ -198,7 +222,7 @@ class UIManager:
             text_scale=0.026 * scale,
             text_fg=(0.6, 0.6, 0.6, 1),
             text_align=TextNode.ACenter,
-            pos=(sidebar_center, 0, -0.08),
+            pos=(sidebar_center, 0, -0.28),
             parent=self.base.aspect2d,
             frameColor=(0, 0, 0, 0),
         )
@@ -210,7 +234,7 @@ class UIManager:
             text_scale=0.022 * scale,
             text_fg=(0.45, 0.45, 0.45, 1),
             text_align=TextNode.ACenter,
-            pos=(sidebar_center, 0, -0.25),
+            pos=(sidebar_center, 0, -0.45),
             parent=self.base.aspect2d,
             frameColor=(0, 0, 0, 0),
             text_mayChange=False,
@@ -299,11 +323,27 @@ class UIManager:
 
         self._texture_preview = OnscreenImage(
             image=texture,
-            pos=(self._sidebar_center, 0, 0.10),
+            pos=(self._sidebar_center, 0, self._preview_pos),
             scale=(pw, 1, ph),
             parent=self.base.aspect2d,
         )
         self._texture_preview.setTransparency(TransparencyAttrib.MAlpha)
+
+    def update_reference_preview(self, image: Image.Image):
+        """Update the reference Voronoi texture preview."""
+        if self._reference_preview is not None:
+            self._reference_preview.destroy()
+
+        texture = self._pil_to_texture(image)
+        pw, ph = self._preview_scale
+
+        self._reference_preview = OnscreenImage(
+            image=texture,
+            pos=(self._sidebar_center, 0, self._ref_pos),
+            scale=(pw, 1, ph),
+            parent=self.base.aspect2d,
+        )
+        self._reference_preview.setTransparency(TransparencyAttrib.MAlpha)
 
     def _pil_to_texture(self, image: Image.Image) -> Texture:
         """Convert PIL Image to Panda3D Texture."""
@@ -331,3 +371,5 @@ class UIManager:
             self._sidebar_bg.removeNode()
         if self._texture_preview:
             self._texture_preview.destroy()
+        if self._reference_preview:
+            self._reference_preview.destroy()

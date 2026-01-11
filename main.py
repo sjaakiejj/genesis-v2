@@ -383,7 +383,13 @@ class TectonicMapGenerator(ShowBase):
         plates = self.plate_manager.generate()
 
         # Start async texture generation
+        # Start async texture generation
         self.plate_renderer.start_plate_generation(plates)
+
+        # Generate debug reference (synchronous for now, or could be threaded)
+        # It's small (512x256) so should be fast enough (~0.1s)
+        ref_img = self.plate_renderer.generate_reference_texture(plates)
+        self.ui_manager.update_reference_preview(ref_img)
 
     def merge_selected_plates(self):
         """Merge the currently selected plates."""
@@ -407,6 +413,12 @@ class TectonicMapGenerator(ShowBase):
             self.plate_renderer.start_plate_generation(
                 self.plate_manager.plates, self.plate_manager.get_selected_ids()
             )
+
+            # Update reference too
+            ref_img = self.plate_renderer.generate_reference_texture(
+                self.plate_manager.plates
+            )
+            self.ui_manager.update_reference_preview(ref_img)
 
 
 def main():

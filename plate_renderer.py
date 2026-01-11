@@ -19,7 +19,7 @@ from panda3d.core import (
     TextureStage,
 )
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 from typing import List, Callable, Optional, Set, TYPE_CHECKING, Tuple
 import math
 import threading
@@ -89,63 +89,13 @@ class PlateTextureGenerator:
         # Warning: if we have > 255 plates, this simple 8-bit map won't work well
         # But for 12-50 plates it is fine.
 
-        # Precompute plate centroids for faster lookup
-        centroids = []
-        for plate in plates:
-            if plate.centroid is not None:
-                centroid = plate.centroid / np.linalg.norm(plate.centroid)
-            else:
-                centroid = np.mean(plate.vertices, axis=0)
-                centroid = centroid / np.linalg.norm(centroid)
-            centroids.append((plate, centroid))
-
-        # Map plate_id to index 0..254 for the ID texture
-        plate_id_to_index = {plate.plate_id: i for i, plate in enumerate(plates)}
-
-        total_rows = self.height
-
-        for y in range(self.height):
-            if self._cancel_flag:
-                return None
-
-            if progress_callback and y % 20 == 0:
-                progress = GenerationProgress(
-                    current=y,
-                    total=total_rows,
-                    percentage=(y / total_rows) * 100,
-                    message=f"Generating texture row {y}/{total_rows}",
-                )
-                progress_callback(progress)
-
-            lat = 90.0 - (y / self.height) * 180.0
-            lat_rad = math.radians(lat)
-            cos_lat = math.cos(lat_rad)
-            sin_lat = math.sin(lat_rad)
-
-            for x in range(self.width):
-                lon = (x / self.width) * 360.0 - 180.0
-                lon_rad = math.radians(lon)
-
-                px = cos_lat * math.cos(lon_rad)
-                py = cos_lat * math.sin(lon_rad)
-                pz = sin_lat
-                point = np.array([px, py, pz])
-
-                closest_plate = self._find_closest_plate(point, centroids)
-
-                if closest_plate is not None:
-                    # Color
-                    r, g, b = closest_plate.color
-                    color_pixels[x, y] = (int(r * 255), int(g * 255), int(b * 255))
-
-                    # ID
-                    idx = plate_id_to_index.get(closest_plate.plate_id, 255)
-                    id_pixels[x, y] = idx
+        # Use vector drawing instead of pixel iteration
+        self._draw_plate_polygons(color_image, id_image, plates)
 
         if progress_callback:
             progress = GenerationProgress(
-                current=total_rows,
-                total=total_rows,
+                current=self.height,
+                total=self.height,
                 percentage=100.0,
                 message="Texture generation complete",
             )
@@ -153,24 +103,49 @@ class PlateTextureGenerator:
 
         return color_image, id_image
 
+    def _draw_plate_polygons(
+        self, color_img: Image.Image, id_img: Image.Image, plates: List["PlateData"]
+    ):
+        """Draw plate polygons onto the textures."""
+        draw_color = ImageDraw.Draw(color_img)
+        draw_id = ImageDraw.Draw(id_img)
+
+        # Generate unique color map for IDs if needed, or simple grayscale
+        # We assume IDs fit in 0-255 for now
+
+        plate_id_to_index = {plate.plate_id: i for i, plate in enumerate(plates)}
+
+        for plate in plates:
+            if not plate.boundary_polygon:
+                continue
+
+            # Color for this plate
+            r, g, b = plate.color
+            fill_color = (int(r * 255), int(g * 255), int(b * 255))
+
+            # ID index
+            idx = plate_id_to_index.get(plate.plate_id, 255)
+
+            # Helper to map lat/lon to pixel coords
+            def to_pixels(lon, lat):
+                # lon: -180 to 180 -> 0 to width
+                x = (lon + 180.0) / 360.0 * self.width
+                # lat: 90 to -90 -> 0 to height (flipped Y)
+                y = (90.0 - lat) / 180.0 * self.height
+                return x, y
+
+            # Draw each polygon in the MultiPolygon
+            for poly in plate.boundary_polygon.geoms:
+                # Get exterior coordinates
+                pixels = [to_pixels(*coord) for coord in poly.exterior.coords]
+
+                # Draw filled polygon
+                draw_color.polygon(pixels, fill=fill_color)
+                draw_id.polygon(pixels, fill=idx)
+
     def cancel(self):
         """Cancel ongoing generation."""
         self._cancel_flag = True
-
-    def _find_closest_plate(self, point: np.ndarray, centroids: list) -> "PlateData":
-        """Find the plate whose centroid is closest to the given point."""
-        closest = None
-        min_dist = float("inf")
-
-        for plate, centroid in centroids:
-            dot = np.dot(point, centroid)
-            dist = -dot
-
-            if dist < min_dist:
-                min_dist = dist
-                closest = plate
-
-        return closest
 
 
 class ThreadedTextureGenerator:
@@ -263,6 +238,7 @@ class PlateRenderer:
 
         self._current_color_texture: Optional[Image.Image] = None
         self._current_id_texture: Optional[Image.Image] = None
+        self._reference_texture: Optional[Image.Image] = None
 
         self._plates: List["PlateData"] = []
         self._selected_ids: Set[int] = set()
@@ -393,6 +369,70 @@ class PlateRenderer:
     def get_plates(self) -> List["PlateData"]:
         """Get the current plates list."""
         return self._plates
+
+    def generate_reference_texture(self, plates: List["PlateData"]) -> Image.Image:
+        """
+        Generate a reference Voronoi texture using pixel-based nearest neighbor.
+        This provides a 'ground truth' visualization for debugging vectorization.
+        """
+        width, height = 512, 256  # Smaller size for debug view
+        img = Image.new("RGB", (width, height), (0, 0, 0))
+        pixels = img.load()
+
+        # Precompute centroids (using seeed points for correct Voronoi matching)
+        centroids = []
+        for plate in plates:
+            if plate.seed_point is not None:
+                c = plate.seed_point / np.linalg.norm(plate.seed_point)
+            elif plate.centroid is not None:
+                c = plate.centroid / np.linalg.norm(plate.centroid)
+            else:
+                c = np.mean(plate.vertices, axis=0)
+                c = c / np.linalg.norm(c)
+            centroids.append((plate, c))
+
+        # Scan pixels
+        for y in range(height):
+            lat = 90.0 - (y / height) * 180.0
+            lat_rad = math.radians(lat)
+            cos_lat = math.cos(lat_rad)
+            sin_lat = math.sin(lat_rad)
+
+            for x in range(width):
+                lon = (x / width) * 360.0 - 180.0
+                lon_rad = math.radians(lon)
+
+                px = cos_lat * math.cos(lon_rad)
+                py = cos_lat * math.sin(lon_rad)
+                pz = sin_lat
+                point = np.array([px, py, pz])
+
+                closest = self._find_closest_plate(point, centroids)
+                if closest:
+                    r, g, b = closest.color
+                    pixels[x, y] = (int(r * 255), int(g * 255), int(b * 255))
+
+        self._reference_texture = img
+        return img
+
+    def get_reference_texture(self) -> Optional[Image.Image]:
+        """Get the last generated reference texture."""
+        return self._reference_texture
+
+    def _find_closest_plate(self, point: np.ndarray, centroids: list) -> "PlateData":
+        """Find the plate whose centroid is closest to the given point."""
+        closest = None
+        min_dist = float("inf")
+
+        for plate, centroid in centroids:
+            dot = np.dot(point, centroid)
+            dist = -dot
+
+            if dist < min_dist:
+                min_dist = dist
+                closest = plate
+
+        return closest
 
     def _apply_textures(self, color_img: Image.Image, id_img: Image.Image):
         """Apply PIL images as textures to the globe stages."""

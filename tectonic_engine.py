@@ -5,11 +5,15 @@ Uses scipy for geometry and pygplates for data structures.
 
 import numpy as np
 from scipy.spatial import SphericalVoronoi
+import shapely
+import shapely.affinity
 import pygplates
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Set, Dict
 import random
 import colorsys
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import clip_by_rect
 
 
 @dataclass
@@ -20,6 +24,8 @@ class PlateData:
     vertices: np.ndarray  # Nx3 array of 3D vertices
     color: Tuple[float, float, float]  # RGB (0-1)
     centroid: np.ndarray = None  # 3D centroid point
+    seed_point: np.ndarray = None  # 3D seed point for Voronoi generation
+    boundary_polygon: Optional[MultiPolygon] = None  # Shapely MultiPolygon (lat/lon)
 
 
 class PlateManager:
@@ -181,9 +187,19 @@ class PlateManager:
             # Generate color
             color = self._generate_plate_color()
 
+            # Get original seed point
+            seed_point = self._voronoi.points[i]
+
             plate = PlateData(
-                plate_id=i, vertices=vertices, color=color, centroid=centroid
+                plate_id=i,
+                vertices=vertices,
+                color=color,
+                centroid=centroid,
+                seed_point=seed_point,
             )
+            # Create explicit polygon boundary
+            plate.boundary_polygon = self._create_polygon_from_vertices(vertices)
+
             self.plates.append(plate)
             self._plate_map[i] = plate
 
@@ -223,6 +239,183 @@ class PlateManager:
         saturation = 0.5 + random.random() * 0.3
         value = 0.6 + random.random() * 0.3
         return colorsys.hsv_to_rgb(hue, saturation, value)
+
+    def _create_polygon_from_vertices(self, vertices: np.ndarray) -> MultiPolygon:
+        """
+        Convert 3D vertices to a Shapely MultiPolygon on equirectangular projection.
+        Handles dateline wrapping.
+        """
+        # Convert to lat/lon with standard spherical interpolation (SLERP)
+        # to ensure edges follow great circles
+        coords = []
+        num_verts = len(vertices)
+
+        for i in range(num_verts):
+            v_start = vertices[i]
+            v_end = vertices[(i + 1) % num_verts]
+
+            # Calculate angle between vectors
+            v1_norm = v_start / np.linalg.norm(v_start)
+            v2_norm = v_end / np.linalg.norm(v_end)
+            dot = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
+            angle = np.arccos(dot)
+
+            # Number of steps based on angle (e.g., 1 step per 2 degrees)
+            steps = max(1, int(np.degrees(angle) / 2.0))
+
+            for t in np.linspace(0, 1, steps, endpoint=False):
+                v = self._slerp(v_start, v_end, t)
+                v_norm = v / np.linalg.norm(v)
+
+                lat = np.degrees(np.arcsin(v_norm[2]))
+                lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
+                coords.append((lon, lat))
+
+        # Close the loop logic handled by wrapping, but we need to ensure the polygon is closed
+        # Since we used endpoint=False and loop over all edges, the first point of the next edge
+        # effectively closes the previous edge.
+        pass  # loop structure handles it
+
+        # However, the previous code structure was:
+        # for v in vertices: convert...
+        # append(coords[0]) to close
+
+        # New structure:
+        # for each edge: interpolate points (excluding end to avoid dupe)
+        # But for the last edge, we need to make sure we connect back.
+
+        # Let's refine the loop:
+        coords = []
+        for i in range(num_verts):
+            v_start = vertices[i]
+            v_end = vertices[(i + 1) % num_verts]
+
+            v1_norm = v_start / np.linalg.norm(v_start)
+            v2_norm = v_end / np.linalg.norm(v_end)
+            dot = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
+            angle = np.arccos(dot)
+
+            steps = max(1, int(np.degrees(angle) / 2.0))
+
+            # Interpolate (include start, exclude end)
+            for j in range(steps):
+                t = j / steps
+                v = self._slerp(v_start, v_end, t)
+                v_norm = v / np.linalg.norm(v)
+                lat = np.degrees(np.arcsin(v_norm[2]))
+                lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
+                coords.append((lon, lat))
+
+        # Close loop
+        if coords:
+            coords.append(coords[0])
+
+        # Simple heuristic for dateline crossing:
+        # If consecutive points are far apart in longitude (> 180), we have a wrap.
+        # However, for correct splitting, it's easier to:
+        # 1. Shift longitudes to 0..360 if we detect crossing (making it continuous)
+        # 2. Or assume it's a valid polygon and "clip" it against the global map?
+
+        # Strategy: Project to -180..180. If edge spans > 180, unwrap one point.
+        # Then we might have a polygon outside [-180, 180].
+        # Finally, split/wrap it back into the box.
+
+        unwrapped = []
+        if coords:
+            unwrapped.append(coords[0])
+            for i in range(1, len(coords)):
+                prev_lon, prev_lat = unwrapped[-1]
+                curr_lon, curr_lat = coords[i]
+
+                # Check delta
+                delta_lon = curr_lon - prev_lon
+                if delta_lon > 180.0:
+                    curr_lon -= 360.0
+                elif delta_lon < -180.0:
+                    curr_lon += 360.0
+
+                unwrapped.append((curr_lon, curr_lat))
+
+        # Check for pole wrapping
+        # If the net longitude change is ~360, we circled a pole.
+        if len(unwrapped) > 1:
+            start_lon = unwrapped[0][0]
+            end_lon = unwrapped[-1][0]
+            net_lon = end_lon - start_lon
+
+            if abs(net_lon) > 180.0:
+                # We wrapped around the globe!
+                # Determine which pole: check average latitude
+                avg_lat = np.mean([p[1] for p in unwrapped])
+
+                pole_lat = 90.0 if avg_lat > 0 else -90.0
+
+                # We need to close the loop along the pole.
+                # The path goes Start -> ... -> End.
+                # To close it, we go End -> (End.x, Pole) -> (Start.x, Pole) -> Start.
+
+                unwrapped.append((end_lon, pole_lat))
+                unwrapped.append((start_lon, pole_lat))
+
+        poly = Polygon(unwrapped)
+
+        # Buffer 0 to fix self-intersections if any
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+
+        # Now clip against the standard world bounds [-180, -90, 180, 90]
+        # But wait, our polygon might be shifted to e.g. [170, 190].
+        # We need to replicate it shifted by +/- 360 and then clip everything.
+
+        polys = []
+
+        # Create copies shifted by -360, 0, +360
+        for shift in [-360.0, 0.0, 360.0]:
+            shifted_poly = self._shift_polygon(poly, shift)
+            # Clip against world box
+            # bounds: minx, miny, maxx, maxy
+            try:
+                # clip_by_rect is efficient
+                clipped = clip_by_rect(shifted_poly, -180.0, -90.0, 180.0, 90.0)
+                if not clipped.is_empty:
+                    if isinstance(clipped, Polygon):
+                        polys.append(clipped)
+                    elif isinstance(clipped, MultiPolygon):
+                        for p in clipped.geoms:
+                            polys.append(p)
+            except Exception as e:
+                # Fallback or ignore
+                pass
+
+        return MultiPolygon(polys)
+
+    def _shift_polygon(self, poly: Polygon, x_shift: float) -> Polygon:
+        """Helper to shift polygon coordinates."""
+        return shapely.affinity.translate(poly, xoff=x_shift)
+
+    def _slerp(self, v0: np.ndarray, v1: np.ndarray, t: float) -> np.ndarray:
+        """Spherical linear interpolation between two vectors."""
+        # Assume v0 and v1 are not normalized but have same length (radius)
+        # Normalize for rotation calculation
+        v0_norm = v0 / np.linalg.norm(v0)
+        v1_norm = v1 / np.linalg.norm(v1)
+
+        dot = np.clip(np.dot(v0_norm, v1_norm), -1.0, 1.0)
+
+        # If vectors are very close, linear int is fine
+        if dot > 0.9995:
+            return v0 + t * (v1 - v0)
+
+        theta = np.arccos(dot)
+        sin_theta = np.sin(theta)
+
+        if sin_theta == 0:
+            return v0
+
+        w1 = np.sin((1 - t) * theta) / sin_theta
+        w2 = np.sin(t * theta) / sin_theta
+
+        return w1 * v0 + w2 * v1
 
     # =========================================================================
     # SELECTION API
