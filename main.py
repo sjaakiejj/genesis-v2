@@ -211,9 +211,13 @@ class TectonicMapGenerator(ShowBase):
 
                 # Update UI
                 self._update_selection_ui()
-
-                # Refresh texture to show highlighting
                 self._refresh_selection_highlight()
+
+    def _refresh_selection_highlight(self):
+        """Regenerate texture with current selection highlighting."""
+        # Selection update is now instant via shaders
+        selected_ids = self.plate_manager.get_selected_ids()
+        self.plate_renderer.refresh_selection(selected_ids)
 
     def _raycast_to_globe(self, mouse_x: float, mouse_y: float) -> np.ndarray:
         """
@@ -297,18 +301,6 @@ class TectonicMapGenerator(ShowBase):
         count = self.plate_manager.get_selection_count()
         can_merge = self.plate_manager.are_selected_neighbors()
         self.ui_manager.update_selection_state(count, can_merge)
-
-    def _refresh_selection_highlight(self):
-        """Regenerate texture with current selection highlighting."""
-        if self._is_generating:
-            # Mark that we need to refresh after current generation
-            self._selection_refresh_pending = True
-            return
-
-        selected_ids = self.plate_manager.get_selected_ids()
-        self.plate_renderer.refresh_selection(selected_ids)
-        self._is_generating = True
-        self.ui_manager.set_status("Updating selection...")
 
     def _zoom_in(self):
         """Zoom camera in."""

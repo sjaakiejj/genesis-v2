@@ -1,7 +1,7 @@
 """
 Plate Renderer - Panda3D Visualization Module
 Renders plates as a texture applied to a procedural sphere.
-Supports threaded generation with progress callbacks and selection highlighting.
+Supports threaded generation with progress callbacks and GPU-based selection highlighting.
 """
 
 from panda3d.core import (
@@ -15,10 +15,12 @@ from panda3d.core import (
     Texture,
     PNMImage,
     LColor,
+    Shader,
+    TextureStage,
 )
 import numpy as np
 from PIL import Image
-from typing import List, Callable, Optional, Set, TYPE_CHECKING
+from typing import List, Callable, Optional, Set, TYPE_CHECKING, Tuple
 import math
 import threading
 from queue import Queue
@@ -41,12 +43,8 @@ class GenerationProgress:
 class PlateTextureGenerator:
     """
     Generates equirectangular plate textures using Pillow.
-    Supports threaded execution with progress callbacks and selection highlighting.
+    Outputs both a color texture and a plate ID map.
     """
-
-    # Selection highlight settings
-    HIGHLIGHT_BRIGHTNESS = 1.4  # Brighten selected plates
-    HIGHLIGHT_BORDER_WIDTH = 3  # Pixels for border effect
 
     def __init__(self, width: int = 1024, height: int = 512):
         """
@@ -63,29 +61,33 @@ class PlateTextureGenerator:
     def generate_texture(
         self,
         plates: List["PlateData"],
-        selected_ids: Optional[Set[int]] = None,
         progress_callback: Optional[Callable[[GenerationProgress], None]] = None,
-    ) -> Optional[Image.Image]:
+    ) -> Optional[Tuple[Image.Image, Image.Image]]:
         """
-        Generate an equirectangular plate texture with optional selection highlighting.
+        Generate equirectangular plate texture and ID map.
 
         Args:
             plates: List of PlateData with vertices and colors
-            selected_ids: Set of plate IDs to highlight
             progress_callback: Optional callback for progress updates
 
         Returns:
-            PIL Image with plate colors, or None if cancelled
+            Tuple of (color_image, id_image), or None if cancelled.
+            id_image encodes plate ID in red channel.
         """
         self._cancel_flag = False
-        selected_ids = selected_ids or set()
 
-        # Create image with ocean blue background
-        image = Image.new("RGB", (self.width, self.height), (30, 60, 90))
-        pixels = image.load()
+        # Create RGB image for color
+        color_image = Image.new("RGB", (self.width, self.height), (30, 60, 90))
+        color_pixels = color_image.load()
 
-        # Build plate ID map for each pixel (for border detection)
-        plate_id_map = np.zeros((self.height, self.width), dtype=np.int32)
+        # Create grayscale image for IDs (0-255)
+        # Using "L" mode (8-bit pixels, black and white)
+        id_image = Image.new("L", (self.width, self.height), 255)  # 255 = no plate
+        id_pixels = id_image.load()
+
+        # Build plate ID map for internal mapping
+        # Warning: if we have > 255 plates, this simple 8-bit map won't work well
+        # But for 12-50 plates it is fine.
 
         # Precompute plate centroids for faster lookup
         centroids = []
@@ -97,9 +99,11 @@ class PlateTextureGenerator:
                 centroid = centroid / np.linalg.norm(centroid)
             centroids.append((plate, centroid))
 
+        # Map plate_id to index 0..254 for the ID texture
+        plate_id_to_index = {plate.plate_id: i for i, plate in enumerate(plates)}
+
         total_rows = self.height
 
-        # Pass 1: Assign plate IDs and colors to each pixel
         for y in range(self.height):
             if self._cancel_flag:
                 return None
@@ -130,20 +134,13 @@ class PlateTextureGenerator:
                 closest_plate = self._find_closest_plate(point, centroids)
 
                 if closest_plate is not None:
-                    plate_id_map[y, x] = closest_plate.plate_id
+                    # Color
                     r, g, b = closest_plate.color
+                    color_pixels[x, y] = (int(r * 255), int(g * 255), int(b * 255))
 
-                    # Highlight selected plates
-                    if closest_plate.plate_id in selected_ids:
-                        r = min(1.0, r * self.HIGHLIGHT_BRIGHTNESS)
-                        g = min(1.0, g * self.HIGHLIGHT_BRIGHTNESS)
-                        b = min(1.0, b * self.HIGHLIGHT_BRIGHTNESS)
-
-                    pixels[x, y] = (int(r * 255), int(g * 255), int(b * 255))
-
-        # Pass 2: Add borders around selected plates
-        if selected_ids:
-            self._add_selection_borders(image, plate_id_map, selected_ids)
+                    # ID
+                    idx = plate_id_to_index.get(closest_plate.plate_id, 255)
+                    id_pixels[x, y] = idx
 
         if progress_callback:
             progress = GenerationProgress(
@@ -154,39 +151,7 @@ class PlateTextureGenerator:
             )
             progress_callback(progress)
 
-        return image
-
-    def _add_selection_borders(
-        self, image: Image.Image, plate_id_map: np.ndarray, selected_ids: Set[int]
-    ):
-        """Add white borders around selected plates."""
-        pixels = image.load()
-        height, width = plate_id_map.shape
-        border_color = (255, 255, 255)  # White border
-
-        for y in range(height):
-            for x in range(width):
-                plate_id = plate_id_map[y, x]
-                if plate_id not in selected_ids:
-                    continue
-
-                # Check if this pixel is on a plate boundary
-                is_border = False
-                for dy in range(-1, 2):
-                    for dx in range(-1, 2):
-                        if dy == 0 and dx == 0:
-                            continue
-                        ny, nx = y + dy, (x + dx) % width  # Wrap x for equirectangular
-                        if 0 <= ny < height:
-                            neighbor_id = plate_id_map[ny, nx]
-                            if neighbor_id != plate_id:
-                                is_border = True
-                                break
-                    if is_border:
-                        break
-
-                if is_border:
-                    pixels[x, y] = border_color
+        return color_image, id_image
 
     def cancel(self):
         """Cancel ongoing generation."""
@@ -220,34 +185,30 @@ class ThreadedTextureGenerator:
         self._progress_queue: Queue = Queue()
         self._is_generating = False
 
-    def start_generation(
-        self, plates: List["PlateData"], selected_ids: Optional[Set[int]] = None
-    ):
+    def start_generation(self, plates: List["PlateData"]):
         """
         Start texture generation in a background thread.
 
         Args:
             plates: List of PlateData to generate texture from
-            selected_ids: Set of plate IDs to highlight
         """
         if self._is_generating:
             self.cancel()
 
         self._is_generating = True
         self._thread = threading.Thread(
-            target=self._generation_worker, args=(plates, selected_ids), daemon=True
+            target=self._generation_worker, args=(plates,), daemon=True
         )
         self._thread.start()
 
-    def _generation_worker(
-        self, plates: List["PlateData"], selected_ids: Optional[Set[int]]
-    ):
+    def _generation_worker(self, plates: List["PlateData"]):
         """Worker thread for texture generation."""
         try:
-            image = self.generator.generate_texture(
-                plates, selected_ids=selected_ids, progress_callback=self._on_progress
+            result = self.generator.generate_texture(
+                plates, progress_callback=self._on_progress
             )
-            self._result_queue.put(("success", image))
+            # result is tuple (color_image, id_image)
+            self._result_queue.put(("success", result))
         except Exception as e:
             self._result_queue.put(("error", str(e)))
         finally:
@@ -288,27 +249,29 @@ class ThreadedTextureGenerator:
 
 class PlateRenderer:
     """
-    Renders tectonic plates using a textured sphere.
+    Renders tectonic plates using a textured sphere with custom shaders.
     """
 
     def __init__(self, parent_node: NodePath, scale: float = 2.0):
         """
         Initialize the plate renderer.
-
-        Args:
-            parent_node: Panda3D NodePath to parent geometry to
-            scale: Scale factor for the globe
         """
         self.parent_node = parent_node
         self.scale = scale
         self.globe: NodePath = None
         self.threaded_generator = ThreadedTextureGenerator()
-        self._current_texture: Optional[Image.Image] = None
+
+        self._current_color_texture: Optional[Image.Image] = None
+        self._current_id_texture: Optional[Image.Image] = None
+
         self._plates: List["PlateData"] = []
         self._selected_ids: Set[int] = set()
 
+        # Shader Inputs
+        self._selection_tex: Texture = None
+
     def setup_globe(self):
-        """Create the globe sphere without any texture (blank state)."""
+        """Create the globe sphere and load shaders."""
         if self.globe is not None:
             self.globe.removeNode()
 
@@ -318,6 +281,36 @@ class PlateRenderer:
 
         # Set a default ocean blue color
         self.globe.setColor(LColor(0.12, 0.24, 0.35, 1.0))
+
+        # Load shaders
+        try:
+            shader = Shader.load(
+                Shader.SL_GLSL,
+                vertex="shaders/globe.vert",
+                fragment="shaders/globe.frag",
+            )
+            self.globe.setShader(shader)
+        except:
+            print("Failed to load shaders! Using default rendering.")
+            self.globe.clearShader()
+
+        # Initialize selection texture (2D, 256x1 pixels) to satisfy Mac/Driver
+        self._selection_tex = Texture("selection_texture")
+        self._selection_tex.setup2dTexture(
+            256, 1, Texture.T_unsigned_byte, Texture.F_red
+        )
+        self._selection_tex.setWrapU(Texture.WMClamp)
+        self._selection_tex.setWrapV(Texture.WMClamp)
+        self._selection_tex.setMagfilter(Texture.FTNearest)
+        self._selection_tex.setMinfilter(Texture.FTNearest)
+
+        # Initialize with zeros (black)
+        img = PNMImage(256, 1, 1)
+        img.fill(0)
+        self._selection_tex.load(img)
+
+        # Bind selection texture to shader input
+        self.globe.setShaderInput("selection_tex", self._selection_tex)
 
     def clear(self):
         """Remove existing globe geometry."""
@@ -330,34 +323,46 @@ class PlateRenderer:
     ):
         """
         Start async plate texture generation.
-
-        Args:
-            plates: List of PlateData from PlateManager
-            selected_ids: Optional set of plate IDs to highlight
         """
         self._plates = plates
         self._selected_ids = selected_ids or set()
-        self.threaded_generator.start_generation(plates, selected_ids)
+        # Update selection texture immediately to match new plate list/indices
+        self._update_selection_texture()
+        self.threaded_generator.start_generation(plates)
         print(f"Started texture generation for {len(plates)} plates...")
 
     def refresh_selection(self, selected_ids: Set[int]):
         """
-        Regenerate texture with updated selection highlighting.
-
-        Args:
-            selected_ids: Set of plate IDs to highlight
+        Update selection state using 1D texture update (on GPU).
+        Fast - no texture regeneration needed!
         """
-        if self._plates:
-            self._selected_ids = selected_ids
-            self.threaded_generator.start_generation(self._plates, selected_ids)
+        self._selected_ids = selected_ids
+        self._update_selection_texture()
+
+    def _update_selection_texture(self):
+        """Update the 1D selection texture based on selected_ids."""
+        if not self._plates:
+            return
+
+        # Map current plates to indices 0..N
+        # We need to rely on the same order as generate_texture used
+        # self._plates is the list passed.
+
+        img = PNMImage(256, 1, 1)
+        img.fill(0)
+
+        for i, plate in enumerate(self._plates):
+            if i >= 256:
+                break  # Limit 256 plates for this optimization
+
+            if plate.plate_id in self._selected_ids:
+                img.setXel(i, 0, 1.0)  # Set to White (Selected)
+
+        self._selection_tex.load(img)
 
     def update(self) -> Optional[GenerationProgress]:
         """
         Update method to be called each frame.
-        Checks for completed texture and applies it.
-
-        Returns:
-            Current progress if generating, None otherwise
         """
         progress = self.threaded_generator.get_progress()
 
@@ -365,9 +370,13 @@ class PlateRenderer:
         if result is not None:
             status, data = result
             if status == "success" and data is not None:
-                self._current_texture = data
-                self._apply_texture(data)
-                print("Texture applied to globe")
+                color_img, id_img = data
+                self._current_color_texture = color_img
+                self._current_id_texture = id_img
+                self._apply_textures(color_img, id_img)
+                # Also apply current selection
+                self._update_selection_texture()
+                print("Textures applied to globe")
             elif status == "error":
                 print(f"Texture generation error: {data}")
 
@@ -378,20 +387,30 @@ class PlateRenderer:
         return self.threaded_generator.is_generating()
 
     def get_current_texture(self) -> Optional[Image.Image]:
-        """Get the current plate texture image."""
-        return self._current_texture
+        """Get the current plate texture image (color only)."""
+        return self._current_color_texture
 
     def get_plates(self) -> List["PlateData"]:
         """Get the current plates list."""
         return self._plates
 
-    def _apply_texture(self, image: Image.Image):
-        """Apply a PIL image as texture to the globe."""
+    def _apply_textures(self, color_img: Image.Image, id_img: Image.Image):
+        """Apply PIL images as textures to the globe stages."""
         if self.globe is None:
             self.setup_globe()
 
-        texture = self._pil_to_texture(image)
-        self.globe.setTexture(texture)
+        # 1. Color Texture (Stage 0, implicit "tex")
+        tex_color = self._pil_to_texture(color_img, "plate_color")
+        self.globe.setTexture(tex_color)
+
+        # 2. ID Texture (Custom Stage)
+        tex_id = self._pil_to_texture(id_img, "plate_id", is_grayscale=True)
+        tex_id.setMagfilter(Texture.FTNearest)  # Important: No filtering for IDs
+        tex_id.setMinfilter(Texture.FTNearest)
+
+        # We assign to a shader input
+        self.globe.setShaderInput("id_tex", tex_id)
+
         self.globe.clearColor()
 
     def _create_uv_sphere(self, segments: int = 64, rings: int = 48) -> NodePath:
@@ -444,22 +463,34 @@ class PlateRenderer:
 
         return NodePath(node)
 
-    def _pil_to_texture(self, image: Image.Image) -> Texture:
+    def _pil_to_texture(
+        self, image: Image.Image, name: str, is_grayscale: bool = False
+    ) -> Texture:
         """Convert PIL Image to Panda3D Texture."""
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
-
         width, height = image.size
 
-        pnm = PNMImage(width, height, 4)
+        texture = Texture(name)
 
-        for y in range(height):
-            for x in range(width):
-                r, g, b, a = image.getpixel((x, y))
-                pnm.setXelA(x, y, r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+        if is_grayscale:
+            # Grayscale for ID map
+            pnm = PNMImage(width, height, 1)
+            for y in range(height):
+                for x in range(width):
+                    val = image.getpixel((x, y))
+                    pnm.setGray(x, y, val / 255.0)
+            texture.load(pnm)
+            texture.setFormat(Texture.F_red)  # Use single channel
+        else:
+            # RGBA for Color map
+            if image.mode != "RGBA":
+                image = image.convert("RGBA")
+            pnm = PNMImage(width, height, 4)
+            for y in range(height):
+                for x in range(width):
+                    r, g, b, a = image.getpixel((x, y))
+                    pnm.setXelA(x, y, r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+            texture.load(pnm)
 
-        texture = Texture("plate_texture")
-        texture.load(pnm)
         texture.setWrapU(Texture.WMRepeat)
         texture.setWrapV(Texture.WMClamp)
 
