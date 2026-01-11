@@ -69,7 +69,7 @@ class PlateManager:
         # Map from plate_id to PlateData
         self._plate_map: Dict[int, PlateData] = {}
 
-    def generate(self) -> List[PlateData]:
+    def generate(self, num_plates: Optional[int] = None) -> List[PlateData]:
         """
         Generate tectonic plates.
 
@@ -78,9 +78,15 @@ class PlateManager:
         3. Convert regions to pygplates Features
         4. Return plate data for visualization
 
+        Args:
+           num_plates: Optional override for number of plates
+
         Returns:
             List of PlateData for rendering
         """
+        if num_plates is not None:
+            self.num_plates = num_plates
+
         # Clear selection when regenerating
         self.clear_selection()
 
@@ -203,6 +209,172 @@ class PlateManager:
             self.plates.append(plate)
             self._plate_map[i] = plate
 
+    def apply_boundary_noise(self, seed: int):
+        """
+        Apply deterministic 3D noise to plate boundaries to create curvature.
+        Re-generates all plate polygons with noise.
+
+        Args:
+            seed: Random seed for noise generation
+        """
+        print(f"Applying boundary noise with seed {seed}")
+
+        for plate in self.plates:
+            # Re-create polygon from original Voronoi vertices, but with noise enabled
+            plate.boundary_polygon = self._create_polygon_from_vertices(
+                plate.vertices, noise_seed=seed
+            )
+
+    def _create_polygon_from_vertices(
+        self, vertices: np.ndarray, noise_seed: Optional[int] = None
+    ) -> MultiPolygon:
+        """
+        Convert 3D vertices to a Shapely MultiPolygon on equirectangular projection.
+        Handles dateline wrapping.
+        Optionally applies noise to the boundary.
+        """
+        coords = []
+        num_verts = len(vertices)
+
+        # Increase steps if we are adding noise to capture detail
+        # Increase steps if we are adding noise to capture detail
+        # Lower divisor = more steps.
+        step_divisor = 0.5 if noise_seed is not None else 2.0
+
+        for i in range(num_verts):
+            v_start = vertices[i]
+            v_end = vertices[(i + 1) % num_verts]
+
+            v1_norm = v_start / np.linalg.norm(v_start)
+            v2_norm = v_end / np.linalg.norm(v_end)
+            dot = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
+            angle = np.arccos(dot)
+
+            # More steps for noise
+            steps = max(1, int(np.degrees(angle) / step_divisor))
+            if noise_seed is not None:
+                steps = max(steps, 20)  # Ensure minimum resolution for noise
+
+            # Interpolate (include start, exclude end)
+            for j in range(steps):
+                t = j / steps
+                v = self._slerp(v_start, v_end, t)
+
+                # Apply noise if requested
+                if noise_seed is not None:
+                    v = self._apply_noise_to_vector(v, noise_seed)
+
+                v_norm = v / np.linalg.norm(v)
+                lat = np.degrees(np.arcsin(v_norm[2]))
+                lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
+                coords.append((lon, lat))
+
+        # Close loop
+        if coords:
+            coords.append(coords[0])
+
+        unwrapped = []
+        if coords:
+            unwrapped.append(coords[0])
+            for i in range(1, len(coords)):
+                prev_lon, prev_lat = unwrapped[-1]
+                curr_lon, curr_lat = coords[i]
+
+                # Check delta
+                delta_lon = curr_lon - prev_lon
+                if delta_lon > 180.0:
+                    curr_lon -= 360.0
+                elif delta_lon < -180.0:
+                    curr_lon += 360.0
+
+                unwrapped.append((curr_lon, curr_lat))
+
+        # Check for pole wrapping
+        if len(unwrapped) > 1:
+            start_lon = unwrapped[0][0]
+            end_lon = unwrapped[-1][0]
+            net_lon = end_lon - start_lon
+
+            if abs(net_lon) > 180.0:
+                avg_lat = np.mean([p[1] for p in unwrapped])
+                pole_lat = 90.0 if avg_lat > 0 else -90.0
+                unwrapped.append((end_lon, pole_lat))
+                unwrapped.append((start_lon, pole_lat))
+
+        poly = Polygon(unwrapped)
+
+        # Buffer 0 to fix self-intersections if any
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+
+        polys = []
+
+        # Create copies shifted by -360, 0, +360
+        for shift in [-360.0, 0.0, 360.0]:
+            shifted_poly = self._shift_polygon(poly, shift)
+            try:
+                clipped = clip_by_rect(shifted_poly, -180.0, -90.0, 180.0, 90.0)
+                if not clipped.is_empty:
+                    if isinstance(clipped, Polygon):
+                        polys.append(clipped)
+                    elif isinstance(clipped, MultiPolygon):
+                        for p in clipped.geoms:
+                            polys.append(p)
+            except Exception as e:
+                pass
+
+        return MultiPolygon(polys)
+
+    def _apply_noise_to_vector(self, v: np.ndarray, seed: int) -> np.ndarray:
+        """
+        Apply deterministic pseudo-random 3D noise using Fractal Brownian Motion (FBM).
+        Creates more natural, varying "coastline-like" boundary deformations.
+        """
+        x, y, z = v
+
+        # FBM Parameters
+        octaves = 4
+        frequency = 3.5  # Base frequency
+        amplitude = 0.08 * self.radius  # Increased base amplitude
+        persistence = 0.5
+        lacunarity = 2.2
+
+        dx = 0.0
+        dy = 0.0
+        dz = 0.0
+
+        # Deterministic offset based on seed
+        # Using a large prime multiplier to scramble the seed
+        offset = (seed * 132049) % 10000
+
+        current_freq = frequency
+        current_amp = amplitude
+
+        for i in range(octaves):
+            # Phase shifts for this octave to de-correlate axes
+            bg_phase = offset + i * 13.37
+
+            # Simple 3D sine wave combination used as pseudo-noise
+            # This is deterministic and continuous
+            n1 = np.sin(y * current_freq + bg_phase) * np.cos(
+                z * current_freq + bg_phase
+            )
+            n2 = np.sin(z * current_freq + bg_phase * 1.3) * np.cos(
+                x * current_freq + bg_phase * 1.3
+            )
+            n3 = np.sin(x * current_freq + bg_phase * 1.7) * np.cos(
+                y * current_freq + bg_phase * 1.7
+            )
+
+            dx += n1 * current_amp
+            dy += n2 * current_amp
+            dz += n3 * current_amp
+
+            current_freq *= lacunarity
+            current_amp *= persistence
+
+        return np.array([x + dx, y + dy, z + dz])
+
     def _build_neighbor_map(self):
         """Build neighbor relationships from Voronoi ridge data."""
         self._neighbors = {plate.plate_id: set() for plate in self.plates}
@@ -239,155 +411,6 @@ class PlateManager:
         saturation = 0.5 + random.random() * 0.3
         value = 0.6 + random.random() * 0.3
         return colorsys.hsv_to_rgb(hue, saturation, value)
-
-    def _create_polygon_from_vertices(self, vertices: np.ndarray) -> MultiPolygon:
-        """
-        Convert 3D vertices to a Shapely MultiPolygon on equirectangular projection.
-        Handles dateline wrapping.
-        """
-        # Convert to lat/lon with standard spherical interpolation (SLERP)
-        # to ensure edges follow great circles
-        coords = []
-        num_verts = len(vertices)
-
-        for i in range(num_verts):
-            v_start = vertices[i]
-            v_end = vertices[(i + 1) % num_verts]
-
-            # Calculate angle between vectors
-            v1_norm = v_start / np.linalg.norm(v_start)
-            v2_norm = v_end / np.linalg.norm(v_end)
-            dot = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
-            angle = np.arccos(dot)
-
-            # Number of steps based on angle (e.g., 1 step per 2 degrees)
-            steps = max(1, int(np.degrees(angle) / 2.0))
-
-            for t in np.linspace(0, 1, steps, endpoint=False):
-                v = self._slerp(v_start, v_end, t)
-                v_norm = v / np.linalg.norm(v)
-
-                lat = np.degrees(np.arcsin(v_norm[2]))
-                lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
-                coords.append((lon, lat))
-
-        # Close the loop logic handled by wrapping, but we need to ensure the polygon is closed
-        # Since we used endpoint=False and loop over all edges, the first point of the next edge
-        # effectively closes the previous edge.
-        pass  # loop structure handles it
-
-        # However, the previous code structure was:
-        # for v in vertices: convert...
-        # append(coords[0]) to close
-
-        # New structure:
-        # for each edge: interpolate points (excluding end to avoid dupe)
-        # But for the last edge, we need to make sure we connect back.
-
-        # Let's refine the loop:
-        coords = []
-        for i in range(num_verts):
-            v_start = vertices[i]
-            v_end = vertices[(i + 1) % num_verts]
-
-            v1_norm = v_start / np.linalg.norm(v_start)
-            v2_norm = v_end / np.linalg.norm(v_end)
-            dot = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
-            angle = np.arccos(dot)
-
-            steps = max(1, int(np.degrees(angle) / 2.0))
-
-            # Interpolate (include start, exclude end)
-            for j in range(steps):
-                t = j / steps
-                v = self._slerp(v_start, v_end, t)
-                v_norm = v / np.linalg.norm(v)
-                lat = np.degrees(np.arcsin(v_norm[2]))
-                lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
-                coords.append((lon, lat))
-
-        # Close loop
-        if coords:
-            coords.append(coords[0])
-
-        # Simple heuristic for dateline crossing:
-        # If consecutive points are far apart in longitude (> 180), we have a wrap.
-        # However, for correct splitting, it's easier to:
-        # 1. Shift longitudes to 0..360 if we detect crossing (making it continuous)
-        # 2. Or assume it's a valid polygon and "clip" it against the global map?
-
-        # Strategy: Project to -180..180. If edge spans > 180, unwrap one point.
-        # Then we might have a polygon outside [-180, 180].
-        # Finally, split/wrap it back into the box.
-
-        unwrapped = []
-        if coords:
-            unwrapped.append(coords[0])
-            for i in range(1, len(coords)):
-                prev_lon, prev_lat = unwrapped[-1]
-                curr_lon, curr_lat = coords[i]
-
-                # Check delta
-                delta_lon = curr_lon - prev_lon
-                if delta_lon > 180.0:
-                    curr_lon -= 360.0
-                elif delta_lon < -180.0:
-                    curr_lon += 360.0
-
-                unwrapped.append((curr_lon, curr_lat))
-
-        # Check for pole wrapping
-        # If the net longitude change is ~360, we circled a pole.
-        if len(unwrapped) > 1:
-            start_lon = unwrapped[0][0]
-            end_lon = unwrapped[-1][0]
-            net_lon = end_lon - start_lon
-
-            if abs(net_lon) > 180.0:
-                # We wrapped around the globe!
-                # Determine which pole: check average latitude
-                avg_lat = np.mean([p[1] for p in unwrapped])
-
-                pole_lat = 90.0 if avg_lat > 0 else -90.0
-
-                # We need to close the loop along the pole.
-                # The path goes Start -> ... -> End.
-                # To close it, we go End -> (End.x, Pole) -> (Start.x, Pole) -> Start.
-
-                unwrapped.append((end_lon, pole_lat))
-                unwrapped.append((start_lon, pole_lat))
-
-        poly = Polygon(unwrapped)
-
-        # Buffer 0 to fix self-intersections if any
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-
-        # Now clip against the standard world bounds [-180, -90, 180, 90]
-        # But wait, our polygon might be shifted to e.g. [170, 190].
-        # We need to replicate it shifted by +/- 360 and then clip everything.
-
-        polys = []
-
-        # Create copies shifted by -360, 0, +360
-        for shift in [-360.0, 0.0, 360.0]:
-            shifted_poly = self._shift_polygon(poly, shift)
-            # Clip against world box
-            # bounds: minx, miny, maxx, maxy
-            try:
-                # clip_by_rect is efficient
-                clipped = clip_by_rect(shifted_poly, -180.0, -90.0, 180.0, 90.0)
-                if not clipped.is_empty:
-                    if isinstance(clipped, Polygon):
-                        polys.append(clipped)
-                    elif isinstance(clipped, MultiPolygon):
-                        for p in clipped.geoms:
-                            polys.append(p)
-            except Exception as e:
-                # Fallback or ignore
-                pass
-
-        return MultiPolygon(polys)
 
     def _shift_polygon(self, poly: Polygon, x_shift: float) -> Polygon:
         """Helper to shift polygon coordinates."""

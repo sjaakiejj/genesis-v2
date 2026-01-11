@@ -133,6 +133,7 @@ class TectonicMapGenerator(ShowBase):
         self.ui_manager = UIManager(self, sidebar_ratio=SIDEBAR_RATIO)
         self.ui_manager.set_generate_callback(self.generate_map)
         self.ui_manager.set_merge_callback(self.merge_selected_plates)
+        self.ui_manager.set_apply_noise_callback(self.apply_noise)
 
     def _setup_camera(self):
         """Setup camera position and orientation."""
@@ -153,7 +154,7 @@ class TectonicMapGenerator(ShowBase):
 
     def _setup_input(self):
         """Setup keyboard and mouse input bindings."""
-        self.accept("space", self.generate_map)
+        self.accept("space", lambda: self.generate_map(12))  # Default 12 for spacebar
         self.accept("escape", self._quit_application)
         self.accept("mouse1", self._on_mouse_press)
         self.accept("mouse1-up", self._on_mouse_release)
@@ -365,12 +366,12 @@ class TectonicMapGenerator(ShowBase):
     # PUBLIC API
     # =========================================================================
 
-    def generate_map(self):
+    def generate_map(self, num_plates: int = 12):
         """Generate a new tectonic map."""
         if self._is_generating:
             return
 
-        print("Starting plate generation...")
+        print(f"Starting plate generation with {num_plates} plates...")
         self._is_generating = True
         self.ui_manager.set_generating(True)
         self.ui_manager.set_status("Generating tectonic plates...")
@@ -380,9 +381,8 @@ class TectonicMapGenerator(ShowBase):
         self._update_selection_ui()
 
         # Generate plate data
-        plates = self.plate_manager.generate()
+        plates = self.plate_manager.generate(num_plates)
 
-        # Start async texture generation
         # Start async texture generation
         self.plate_renderer.start_plate_generation(plates)
 
@@ -390,6 +390,25 @@ class TectonicMapGenerator(ShowBase):
         # It's small (512x256) so should be fast enough (~0.1s)
         ref_img = self.plate_renderer.generate_reference_texture(plates)
         self.ui_manager.update_reference_preview(ref_img)
+
+    def apply_noise(self, seed: int):
+        """Apply noise to plate boundaries."""
+        if self._is_generating:
+            return
+
+        print(f"Applying plate boundary noise (seed: {seed})...")
+
+        # Apply noise to polygons
+        self.plate_manager.apply_boundary_noise(seed)
+
+        # Regenerate textures
+        self._is_generating = True
+        self.ui_manager.set_generating(True)
+        self.ui_manager.set_status("Applying boundary noise...")
+
+        self.plate_renderer.start_plate_generation(
+            self.plate_manager.plates, self.plate_manager.get_selected_ids()
+        )
 
     def merge_selected_plates(self):
         """Merge the currently selected plates."""
