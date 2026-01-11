@@ -400,10 +400,89 @@ class PlateManager:
         print(f"Applying boundary noise with seed {seed}")
 
         for plate in self.plates:
-            # Re-create polygon from original Voronoi vertices, but with noise enabled
-            plate.boundary_polygon = self._create_polygon_from_vertices(
-                plate.vertices, noise_seed=seed
-            )
+            # Check if this is a merged plate by comparing vertices count with
+            # what we'd expect from a single Voronoi region.
+            # Merged plates have combined vertices from multiple regions,
+            # and their boundary_polygon is already a proper merged shape.
+            # For merged plates, we apply noise to the existing polygon boundary.
+
+            is_merged_plate = self._is_merged_plate(plate)
+
+            if is_merged_plate and plate.boundary_polygon:
+                # Apply noise to existing polygon boundary
+                plate.boundary_polygon = self._apply_noise_to_polygon(
+                    plate.boundary_polygon, seed
+                )
+            else:
+                # Re-create polygon from original Voronoi vertices with noise
+                plate.boundary_polygon = self._create_polygon_from_vertices(
+                    plate.vertices, noise_seed=seed
+                )
+
+    def _is_merged_plate(self, plate: PlateData) -> bool:
+        """
+        Determine if a plate is a merged plate.
+        Merged plates have vertices that are a concatenation of multiple regions,
+        not an ordered ring of Voronoi vertices.
+        """
+        # A merged plate's seed_point is set to its centroid (approximately)
+        # and has more vertices than typical Voronoi regions
+        # Simple heuristic: if seed_point equals centroid, it's likely merged
+        if plate.seed_point is not None and plate.centroid is not None:
+            diff = np.linalg.norm(plate.seed_point - plate.centroid)
+            if diff < 0.01:  # Very close - likely merged
+                return True
+        return False
+
+    def _apply_noise_to_polygon(
+        self, polygon: MultiPolygon, noise_seed: int
+    ) -> MultiPolygon:
+        """
+        Apply noise to an existing MultiPolygon by perturbing its boundary coordinates.
+        """
+        result_polys = []
+
+        for poly in polygon.geoms:
+            # Get exterior coordinates (lon, lat)
+            coords = list(poly.exterior.coords)
+            noisy_coords = []
+
+            for i, (lon, lat) in enumerate(coords[:-1]):  # Exclude closing point
+                # Convert lat/lon to 3D Cartesian
+                lat_rad = np.radians(lat)
+                lon_rad = np.radians(lon)
+                x = np.cos(lat_rad) * np.cos(lon_rad) * self.radius
+                y = np.cos(lat_rad) * np.sin(lon_rad) * self.radius
+                z = np.sin(lat_rad) * self.radius
+
+                v = np.array([x, y, z])
+
+                # Apply noise
+                v_noisy = self._apply_noise_to_vector(v, noise_seed)
+
+                # Convert back to lat/lon
+                v_norm = v_noisy / np.linalg.norm(v_noisy)
+                new_lat = np.degrees(np.arcsin(v_norm[2]))
+                new_lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
+
+                noisy_coords.append((new_lon, new_lat))
+
+            # Close the polygon
+            if noisy_coords:
+                noisy_coords.append(noisy_coords[0])
+
+            # Create new polygon
+            new_poly = Polygon(noisy_coords)
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+
+            if not new_poly.is_empty:
+                if isinstance(new_poly, Polygon):
+                    result_polys.append(new_poly)
+                elif isinstance(new_poly, MultiPolygon):
+                    result_polys.extend(new_poly.geoms)
+
+        return MultiPolygon(result_polys) if result_polys else polygon
 
     def _create_polygon_from_vertices(
         self, vertices: np.ndarray, noise_seed: Optional[int] = None
