@@ -23,6 +23,7 @@ from panda3d.core import (
 )
 from PIL import Image
 from typing import Optional, Callable
+import random
 
 
 class UIManager:
@@ -185,6 +186,21 @@ class UIManager:
 
         s3_height = 0.20
         self._add_section_to_layout(s3_frame, s3_content, s3_height)
+
+        # 4. Crust Classification Section
+        s4_frame, s4_content = self._create_section("Step 4: Crust Classification")
+
+        y_cursor = -0.02
+
+        self._classify_crust_button = self._create_button(
+            s4_content,
+            "Classify Crust",
+            (0, y_cursor),
+            self._on_classify_crust_clicked,
+        )
+
+        s4_height = 0.10
+        self._add_section_to_layout(s4_frame, s4_content, s4_height)
 
         # --- BOTTOM PANELS ---
         # Fixed area at bottom for status/map
@@ -381,9 +397,14 @@ class UIManager:
     def set_apply_noise_callback(self, callback: Callable):
         self._on_apply_noise = callback
 
-    def set_kinematics_callbacks(self, on_assign: Callable, on_toggle: Callable):
+    def set_kinematics_callbacks(self, on_assign, on_toggle_vectors):
+        """Set callbacks for kinematics actions."""
         self._on_assign_kinematics = on_assign
-        self._on_toggle_vectors = on_toggle
+        self._on_toggle_vectors = on_toggle_vectors
+
+    def set_classify_crust_callback(self, callback: Callable):
+        """Set callback for crust classification."""
+        self._on_classify_crust = callback
 
     def _on_generate_clicked(self):
         if self._on_generate:
@@ -407,20 +428,22 @@ class UIManager:
 
     def _on_assign_kinematics_clicked(self):
         if self._on_assign_kinematics:
-            # Re-use seed entry if valid, else random
-            try:
-                seed_val = int(self._seed_entry.get())
-            except ValueError:
-                seed_val = 0  # Default if empty
+            # Generate random seed
+            seed_val = random.randint(0, 99999)
             self._on_assign_kinematics(seed_val)
 
-    def _on_toggle_vectors_clicked(self):
-        self._vectors_visible = not self._vectors_visible
-        label = "ON" if self._vectors_visible else "OFF"
-        self._toggle_vectors_button["text"] = f"Show Vectors: {label}"
+    def _on_classify_crust_clicked(self):
+        if self._on_classify_crust:
+            self._on_classify_crust()
 
+    def _on_toggle_vectors_clicked(self):
         if self._on_toggle_vectors:
-            self._on_toggle_vectors(self._vectors_visible)
+            self._vectors_visible = not self._vectors_visible
+            label = "ON" if self._vectors_visible else "OFF"
+            self._toggle_vectors_button["text"] = f"Show Vectors: {label}"
+
+            if self._on_toggle_vectors:
+                self._on_toggle_vectors(self._vectors_visible)
 
     def show_progress(self, visible: bool = True):
         if visible:

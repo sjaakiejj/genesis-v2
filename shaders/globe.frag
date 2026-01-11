@@ -31,30 +31,31 @@ void main() {
         color.rgb *= 1.4;
     }
 
-    // 5. Border Detection
-    // Check neighbors to see if we are at a boundary between selected and unselected
-    // or between two different selected plates (visual preference)
-    // We only draw border inside the SELECTED plate for cleaner look.
+    // 5. Border Detection (for all plates - black borders)
+    float border = 0.0;
+    float width_u = 0.003; // Approx 3 pixels at 1024 width
+    float width_v = 0.006; // Approx 3 pixels at 512 height
     
-    if (is_selected > 0.5) {
-        float border = 0.0;
-        float width_u = 0.003; // Approx 3 pixels at 1024 width
-        float width_v = 0.006; // Approx 3 pixels at 512 height
-        
-        // Check 4 neighbors
-        float id_u1 = texture2D(id_tex, texcoord + vec2(width_u, 0.0)).r;
-        float id_u2 = texture2D(id_tex, texcoord - vec2(width_u, 0.0)).r;
-        float id_v1 = texture2D(id_tex, texcoord + vec2(0.0, width_v)).r;
-        float id_v2 = texture2D(id_tex, texcoord - vec2(0.0, width_v)).r;
-        
-        // If any neighbor has different ID, it's a border
-        if (abs(id_u1 - id_norm) > 0.001 || abs(id_u2 - id_norm) > 0.001 ||
-            abs(id_v1 - id_norm) > 0.001 || abs(id_v2 - id_norm) > 0.001) {
-            border = 1.0;
-        }
-        
-        if (border > 0.5) {
-            color.rgb = vec3(1.0, 1.0, 1.0); // White border
+    // Check 4 neighbors
+    float id_u1 = texture2D(id_tex, texcoord + vec2(width_u, 0.0)).r;
+    float id_u2 = texture2D(id_tex, texcoord - vec2(width_u, 0.0)).r;
+    float id_v1 = texture2D(id_tex, texcoord + vec2(0.0, width_v)).r;
+    float id_v2 = texture2D(id_tex, texcoord - vec2(0.0, width_v)).r;
+    
+    // If any neighbor has different ID, it's a border
+    if (abs(id_u1 - id_norm) > 0.001 || abs(id_u2 - id_norm) > 0.001 ||
+        abs(id_v1 - id_norm) > 0.001 || abs(id_v2 - id_norm) > 0.001) {
+        border = 1.0;
+    }
+    
+    // Apply border color
+    if (border > 0.5) {
+        if (is_selected > 0.5) {
+            // White border for selected plates
+            color.rgb = vec3(1.0, 1.0, 1.0);
+        } else {
+            // Black border for all other plates
+            color.rgb = vec3(0.0, 0.0, 0.0);
         }
     }
 

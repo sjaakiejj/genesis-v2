@@ -120,9 +120,22 @@ class PlateTextureGenerator:
             if not plate.boundary_polygon:
                 continue
 
-            # Color for this plate
-            r, g, b = plate.color
-            fill_color = (int(r * 255), int(g * 255), int(b * 255))
+            # Color based on CrustType
+            # Oceanic: Dark Blue (~ #1a2b4b -> 26, 43, 75)
+            # Continental: Land Green/Brown (~ #4b6b3b -> 75, 107, 59)
+            # If unknown, fallback to plate.color
+
+            fill_color = (
+                int(plate.color[0] * 255),
+                int(plate.color[1] * 255),
+                int(plate.color[2] * 255),
+            )
+
+            if hasattr(plate, "crust_type") and plate.crust_type:
+                if plate.crust_type.name == "OCEANIC":
+                    fill_color = (135, 206, 235)  # Light Blue (Sky Blue)
+                elif plate.crust_type.name == "CONTINENTAL":
+                    fill_color = (144, 238, 144)  # Light Green (Pale Green)
 
             # ID index
             idx = plate_id_to_index.get(plate.plate_id, 255)

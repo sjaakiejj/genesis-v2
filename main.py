@@ -135,8 +135,10 @@ class TectonicMapGenerator(ShowBase):
         self.ui_manager.set_merge_callback(self.merge_selected_plates)
         self.ui_manager.set_apply_noise_callback(self.apply_noise)
         self.ui_manager.set_kinematics_callbacks(
-            self.assign_kinematics_and_crust, self.toggle_vector_visibility
+            on_assign=self.assign_kinematics,
+            on_toggle_vectors=self.toggle_vector_visibility,
         )
+        self.ui_manager.set_classify_crust_callback(self.assign_crust_types)
 
     def _setup_camera(self):
         """Setup camera position and orientation."""
@@ -442,22 +444,44 @@ class TectonicMapGenerator(ShowBase):
             )
             self.ui_manager.update_reference_preview(ref_img)
 
-    def assign_kinematics_and_crust(self, seed: int):
+    def assign_kinematics(self, seed: int):
         """
-        Assign kinematics and crust types to plates.
+        Assign kinematics only.
         """
         if self._is_generating:
             return
 
-        print(f"Assigning kinematics (seed: {seed})...")
-        self.plate_manager.assign_kinematics(seed)
+        try:
+            print(f"Assigning kinematics (seed: {seed})...")
+            self.plate_manager.assign_kinematics(seed)
 
-        # Render vectors
-        self.plate_renderer.render_velocity_vectors(
-            self.plate_manager.plates, visible=self.ui_manager._vectors_visible
+            # Render vectors
+            self.plate_renderer.render_velocity_vectors(
+                self.plate_manager.plates, visible=self.ui_manager._vectors_visible
+            )
+
+            self.ui_manager.set_status("Kinematics assigned.")
+        except Exception as e:
+            print(f"CRASH in assign_kinematics: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    def assign_crust_types(self):
+        """Classify crust types and update visualization."""
+        if self._is_generating:
+            return
+
+        print("Assigning crust types...")
+        self.plate_manager.assign_crust_types()
+
+        # Regenerate texture to show crust types
+        self._is_generating = True
+        self.ui_manager.set_generating(True)
+        self.ui_manager.set_status("Updating crust visualization...")
+        self.plate_renderer.start_plate_generation(
+            self.plate_manager.plates, self.plate_manager.get_selected_ids()
         )
-
-        self.ui_manager.set_status("Kinematics assigned.")
 
     def toggle_vector_visibility(self, visible: bool):
         """Toggle visibility of velocity vectors."""

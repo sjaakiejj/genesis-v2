@@ -8,8 +8,9 @@ from scipy.spatial import SphericalVoronoi
 import shapely
 import shapely.affinity
 import pygplates
-from dataclasses import dataclass
-from typing import List, Tuple, Optional, Set, Dict
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Set, Dict, Any
+from enum import Enum, auto
 import random
 import colorsys
 import math
@@ -17,21 +18,26 @@ from shapely.geometry import Polygon, MultiPolygon, Point
 from shapely.ops import clip_by_rect, unary_union
 
 
+class CrustType(Enum):
+    OCEANIC = auto()
+    CONTINENTAL = auto()
+
+
 @dataclass
 class PlateData:
     """Lightweight data class for plate visualization."""
 
     plate_id: int
+    seed_point: np.ndarray  # 3D cartesian
     vertices: np.ndarray  # Nx3 array of 3D vertices
-    color: Tuple[float, float, float]  # RGB (0-1)
-    centroid: np.ndarray = None  # 3D centroid point
-    seed_point: np.ndarray = None  # 3D seed point for Voronoi generation
-    boundary_polygon: Optional[MultiPolygon] = None  # Shapely MultiPolygon (lat/lon)
-
-    # Kinematics & Properties
-    velocity_vector: Optional[np.ndarray] = None  # 3D vector at centroid
-    crust_type: str = "Oceanic"  # "Oceanic" or "Continental"
-    rotation_pole: Optional[pygplates.FiniteRotation] = None
+    color: Tuple[float, float, float]
+    boundary_polygon: Optional[Polygon] = None
+    neighbors: List[int] = field(default_factory=list)
+    centroid: Optional[np.ndarray] = None
+    velocity_vector: Optional[np.ndarray] = None
+    rotation_pole: Optional["pygplates.FiniteRotation"] = None
+    crust_type: Optional[CrustType] = None
+    feature: Optional["pygplates.Feature"] = None
 
 
 class PlateManager:
@@ -310,6 +316,72 @@ class PlateManager:
             if velocity_vectors:
                 v_vec = velocity_vectors[0].to_xyz()  # 3D vector (x,y,z)
                 plate.velocity_vector = np.array(v_vec)
+
+    def assign_crust_types(self):
+        """
+        Classify plates as Oceanic or Continental based on area.
+        The largest plates covering ~70% of the surface are Oceanic.
+        The rest are Continental.
+        """
+        if not self.plates:
+            return
+
+        # 1. Calculate Areas
+        plate_areas = []
+        total_area = 0.0
+
+        for plate in self.plates:
+            area = 0.0
+            if plate.boundary_polygon:
+                area = self._calculate_plate_area_approx(plate.boundary_polygon)
+            plate_areas.append((plate, area))
+            total_area += area
+
+        # 2. Sort by Area (Descending)
+        plate_areas.sort(key=lambda x: x[1], reverse=True)
+
+        # 3. Assign Types
+        current_area = 0.0
+        oceanic_threshold = total_area * 0.70
+
+        for plate, area in plate_areas:
+            # Create features
+            # We need to convert shapely polygon to pygplates geometry
+            # For now simplified: skipping geometry creation or using placeholder
+            # Ideally we convert shapely -> lat/lon list -> pygplates.PolygonOnSphere
+
+            if current_area < oceanic_threshold:
+                plate.crust_type = CrustType.OCEANIC
+                # In pygplates, we would create a feature of type gpml:OceanicCrust
+            else:
+                plate.crust_type = CrustType.CONTINENTAL
+                # gpml:ContinentalCrust
+
+            current_area += area
+
+        print(
+            f"Assigned Crust Types: {sum(1 for p in self.plates if p.crust_type == CrustType.OCEANIC)} Oceanic, {sum(1 for p in self.plates if p.crust_type == CrustType.CONTINENTAL)} Continental"
+        )
+
+    def _calculate_plate_area_approx(self, polygon: Polygon) -> float:
+        """
+        Calculate approximate area of a plate polygon on a sphere.
+        Using simple spherical excess or just 2D area (since checking relative size).
+        For sorting purposes, just summing triangle areas on unit sphere is fine.
+        """
+        # Simplest approximation: Area of 2D polygon in lat/lon space,
+        # weighted by cos(lat) to account for spherical distortion.
+        # Or even simpler: Shapely area.
+        # But shapely area is in degrees^2, which distorts heavily near poles.
+        # Let's use a slightly better approximation.
+
+        return polygon.area  # Basic 2D area for V1
+
+    def _create_pygplates_feature(self, plate: PlateData):
+        """Create pygplates feature with geometry."""
+        # Convert shapely polygon to pygplates geometry
+        # TODO: Implement conversion if needed for GPlates export
+        pass
 
     def _cartesian_to_lat_lon(self, v: np.ndarray) -> Tuple[float, float]:
         v_norm = v / np.linalg.norm(v)
