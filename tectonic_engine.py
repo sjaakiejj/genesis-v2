@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Set, Dict
 import random
 import colorsys
-from shapely.geometry import Polygon, MultiPolygon
-from shapely.ops import clip_by_rect
+from shapely.geometry import Polygon, MultiPolygon, Point
+from shapely.ops import clip_by_rect, unary_union
 
 
 @dataclass
@@ -541,6 +541,17 @@ class PlateManager:
         new_centroid = np.mean(combined_vertices, axis=0)
         new_centroid = new_centroid / np.linalg.norm(new_centroid) * self.radius
 
+        # Create merged polygon
+        polys_to_merge = []
+        for pid in selected:
+            p_data = self._plate_map[pid]
+            if p_data.boundary_polygon:
+                polys_to_merge.append(p_data.boundary_polygon)
+
+        merged_poly = unary_union(polys_to_merge)
+        if isinstance(merged_poly, Polygon):
+            merged_poly = MultiPolygon([merged_poly])
+
         # Create merged plate with first selected ID
         new_id = selected[0]
         merged_plate = PlateData(
@@ -548,6 +559,8 @@ class PlateManager:
             vertices=combined_vertices,
             color=keep_color,
             centroid=new_centroid,
+            seed_point=new_centroid,  # Use centroid as proxy for seed
+            boundary_polygon=merged_poly,
         )
 
         # Remove old plates
@@ -571,12 +584,14 @@ class PlateManager:
         self._neighbors[new_id] = merged_neighbors
 
         # Update other plates' neighbor lists
+        # 1. Remove old selected plates from everyone's lists
         for pid in list(self._neighbors.keys()):
             self._neighbors[pid] -= set(selected)
-            if any(s in selected for s in self._neighbors.get(pid, set())):
-                self._neighbors[pid].add(new_id)
-            if new_id in merged_neighbors:
-                self._neighbors[pid].add(new_id)
+
+        # 2. Add new merged plate to its neighbors' lists (reciprocal)
+        for n_id in merged_neighbors:
+            if n_id in self._neighbors:
+                self._neighbors[n_id].add(new_id)
 
         # Clear selection
         self.clear_selection()
@@ -603,17 +618,27 @@ class PlateManager:
 
         # Normalize point to sphere surface
         point = point_3d / np.linalg.norm(point_3d) * self.radius
+        v_norm = point / np.linalg.norm(point)
 
-        # Find closest centroid
+        # Convert to lat/lon for point-in-polygon check
+        lat = np.degrees(np.arcsin(v_norm[2]))
+        lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
+        pt = Point(lon, lat)
+
+        # Check containment first (accurate)
+        for plate in self.plates:
+            if plate.boundary_polygon and plate.boundary_polygon.contains(pt):
+                return plate.plate_id
+
+        # Fallback to closest centroid if not in any polygon (e.g. gaps)
         closest_id = None
         min_dist = float("inf")
 
         for plate in self.plates:
             if plate.centroid is None:
                 continue
-            # Use dot product for angular distance
             dot = np.dot(point, plate.centroid)
-            dist = -dot  # Higher dot = closer
+            dist = -dot
             if dist < min_dist:
                 min_dist = dist
                 closest_id = plate.plate_id
