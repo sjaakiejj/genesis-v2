@@ -134,6 +134,9 @@ class TectonicMapGenerator(ShowBase):
         self.ui_manager.set_generate_callback(self.generate_map)
         self.ui_manager.set_merge_callback(self.merge_selected_plates)
         self.ui_manager.set_apply_noise_callback(self.apply_noise)
+        self.ui_manager.set_kinematics_callbacks(
+            self.assign_kinematics_and_crust, self.toggle_vector_visibility
+        )
 
     def _setup_camera(self):
         """Setup camera position and orientation."""
@@ -438,6 +441,27 @@ class TectonicMapGenerator(ShowBase):
                 self.plate_manager.plates
             )
             self.ui_manager.update_reference_preview(ref_img)
+
+    def assign_kinematics_and_crust(self, seed: int):
+        """
+        Assign kinematics and crust types to plates.
+        """
+        if self._is_generating:
+            return
+
+        print(f"Assigning kinematics (seed: {seed})...")
+        self.plate_manager.assign_kinematics(seed)
+
+        # Render vectors
+        self.plate_renderer.render_velocity_vectors(
+            self.plate_manager.plates, visible=self.ui_manager._vectors_visible
+        )
+
+        self.ui_manager.set_status("Kinematics assigned.")
+
+    def toggle_vector_visibility(self, visible: bool):
+        """Toggle visibility of velocity vectors."""
+        self.plate_renderer.set_vectors_visible(visible)
 
 
 def main():

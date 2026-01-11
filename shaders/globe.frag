@@ -4,6 +4,8 @@
 uniform sampler2D p3d_Texture0; // Color Texture (stage 0)
 uniform sampler2D id_tex;       // Plate ID Texture (custom input)
 uniform sampler2D selection_tex;// Selection State (2D 256x1, indexed by ID)
+uniform sampler2D vector_tex;   // Vector Arrow Overlay
+uniform float show_vectors;     // Toggle visibility (0.0 or 1.0)
 
 // Inputs from Vertex Shader
 varying vec2 texcoord;
@@ -60,6 +62,10 @@ void main() {
     vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
     float diff = max(dot(normal, lightDir), 0.2);
     color.rgb *= diff;
+    
+    // 6. Vector Overlay (Unlit)
+    vec4 vec_color = texture2D(vector_tex, texcoord);
+    color.rgb = mix(color.rgb, vec_color.rgb, vec_color.a * show_vectors);
 
     gl_FragColor = color;
 }

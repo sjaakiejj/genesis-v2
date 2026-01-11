@@ -17,6 +17,7 @@ from panda3d.core import (
     LColor,
     Shader,
     TextureStage,
+    LineSegs,
 )
 import numpy as np
 from PIL import Image, ImageDraw
@@ -245,6 +246,7 @@ class PlateRenderer:
 
         # Shader Inputs
         self._selection_tex: Texture = None
+        self._vector_tex: Texture = None
 
     def setup_globe(self):
         """Create the globe sphere and load shaders."""
@@ -280,13 +282,29 @@ class PlateRenderer:
         self._selection_tex.setMagfilter(Texture.FTNearest)
         self._selection_tex.setMinfilter(Texture.FTNearest)
 
-        # Initialize with zeros (black)
+        # Initialize vector texture (transparent)
+        self._vector_tex = Texture("vector_texture")
+        self._vector_tex.setup2dTexture(
+            1024, 512, Texture.T_unsigned_byte, Texture.F_rgba
+        )
+        self._vector_tex.setWrapU(Texture.WMRepeat)
+        self._vector_tex.setWrapV(Texture.WMClamp)
+
+        # Initialize with transparent
         img = PNMImage(256, 1, 1)
         img.fill(0)
         self._selection_tex.load(img)
 
-        # Bind selection texture to shader input
+        # Clear vector tex
+        img_v = PNMImage(1024, 512, 4)
+        img_v.fill(0, 0, 0)
+        img_v.alphaFill(0)
+        self._vector_tex.load(img_v)
+
+        # Bind textures to shader input
         self.globe.setShaderInput("selection_tex", self._selection_tex)
+        self.globe.setShaderInput("vector_tex", self._vector_tex)
+        self.globe.setShaderInput("show_vectors", 1.0)
 
     def clear(self):
         """Remove existing globe geometry."""
@@ -535,3 +553,123 @@ class PlateRenderer:
         texture.setWrapV(Texture.WMClamp)
 
         return texture
+
+    def set_vectors_visible(self, visible: bool):
+        """Toggle visibility of velocity vectors."""
+        if self.globe:
+            val = 1.0 if visible else 0.0
+            self.globe.setShaderInput("show_vectors", val)
+
+    def render_velocity_vectors(self, plates: List["PlateData"], visible: bool = True):
+        """
+        Render velocity vectors onto the vector texture.
+
+        Args:
+            plates: List of plates with velocity vectors
+            visible: Whether to show the vectors
+        """
+        self.set_vectors_visible(visible)
+        if not visible:
+            return
+
+        # Generate texture on CPU
+        img = Image.new("RGBA", (1024, 512), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Arrow shape (pointing UP, centered at 0,0)
+        # Scale: 20px
+        arrow_pts = [(0, -20), (10, 10), (0, 0), (-10, 10)]
+
+        width = 1024
+        height = 512
+
+        for plate in plates:
+            if plate.centroid is None or plate.velocity_vector is None:
+                continue
+
+            # 1. Get Centroid Lat/Lon
+            lat, lon = self._vec3_to_latlon(plate.centroid)
+
+            # 2. Map to UV (Pix)
+            x = (lon + 180.0) / 360.0 * width
+            y = (90.0 - lat) / 180.0 * height
+
+            # 3. Calculate Azimuth
+            # Convert 3D velocity to local tangent plane
+            azimuth = self._calculate_azimuth(plate.centroid, plate.velocity_vector)
+
+            # 4. Draw Arrow
+            # Rotate points
+            # Azimuth is clockwise from North.
+            # In screen coords, Y is down.
+            # North is -Y.
+            # 0 deg = Up (-Y).
+            # 90 deg = Right (+X).
+            # cos(theta) * x - sin(theta) * y ...
+
+            theta = math.radians(azimuth)
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
+
+            # Transform points
+            poly_pts = []
+            for px, py in arrow_pts:
+                # Rotate
+                rx = px * cos_t - py * sin_t
+                ry = px * sin_t + py * cos_t
+
+                # Translate
+                poly_pts.append((x + rx, y + ry))
+
+            draw.polygon(poly_pts, fill=(255, 255, 0, 255))  # Yellow
+
+            # Handle wrapping (if x < margin or x > width - margin)
+            # Draw copy offset by width
+            if x < 40:
+                poly_pts_r = [(px + width, py) for px, py in poly_pts]
+                draw.polygon(poly_pts_r, fill=(255, 255, 0, 255))
+            elif x > width - 40:
+                poly_pts_l = [(px - width, py) for px, py in poly_pts]
+                draw.polygon(poly_pts_l, fill=(255, 255, 0, 255))
+
+        # Upload to Texture
+        texture = self._pil_to_texture(img, "vector_map")
+        # We need to copy ram image to self._vector_tex
+        self._vector_tex.setRamImage(texture.getRamImage())
+
+    def _vec3_to_latlon(self, v: np.ndarray) -> Tuple[float, float]:
+        v_norm = v / np.linalg.norm(v)
+        lat = np.degrees(np.arcsin(v_norm[2]))
+        lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
+        return (lat, lon)
+
+    def _calculate_azimuth(self, pos: np.ndarray, vel: np.ndarray) -> float:
+        """
+        Calculate azimuth of velocity vector at position.
+        Returns degrees clockwise from North.
+        """
+        # Normal is position (sphere)
+        p = pos / np.linalg.norm(pos)
+
+        # North pole
+        k = np.array([0, 0, 1])
+
+        # East direction: k x p
+        # If p is North Pole, East is undefined.
+        if abs(p[2]) > 0.99:
+            east = np.array([1, 0, 0])
+        else:
+            east = np.cross(k, p)
+            east = east / np.linalg.norm(east)
+
+        # North direction: p x east
+        north = np.cross(p, east)
+
+        # Project velocity onto East/North
+        v_e = np.dot(vel, east)
+        v_n = np.dot(vel, north)
+
+        # Atan2(y, x) -> y=East, x=North
+        # Result is angle from North towards East (CW)
+        angle = math.degrees(math.atan2(v_e, v_n))
+        return angle

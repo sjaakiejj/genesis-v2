@@ -68,6 +68,8 @@ class UIManager:
         self._on_generate: Optional[Callable] = None
         self._on_merge: Optional[Callable] = None
         self._on_apply_noise: Optional[Callable] = None
+        self._on_assign_kinematics: Optional[Callable] = None
+        self._on_toggle_vectors: Optional[Callable] = None
 
         # Create UI
         self._create_sidebar()
@@ -158,6 +160,31 @@ class UIManager:
         # Register Section 2
         s2_height = 0.18
         self._add_section_to_layout(s2_frame, s2_content, s2_height)
+
+        # 3. Kinematics Section
+        s3_frame, s3_content = self._create_section("Step 3: Kinematics")
+
+        y_cursor = -0.02
+
+        self._assign_kinematics_button = self._create_button(
+            s3_content,
+            "Assign Movement",
+            (0, y_cursor),
+            self._on_assign_kinematics_clicked,
+        )
+
+        y_cursor -= 0.08
+
+        self._toggle_vectors_button = self._create_button(
+            s3_content,
+            "Show Vectors: ON",
+            (0, y_cursor),
+            self._on_toggle_vectors_clicked,
+        )
+        self._vectors_visible = True
+
+        s3_height = 0.20
+        self._add_section_to_layout(s3_frame, s3_content, s3_height)
 
         # --- BOTTOM PANELS ---
         # Fixed area at bottom for status/map
@@ -354,6 +381,10 @@ class UIManager:
     def set_apply_noise_callback(self, callback: Callable):
         self._on_apply_noise = callback
 
+    def set_kinematics_callbacks(self, on_assign: Callable, on_toggle: Callable):
+        self._on_assign_kinematics = on_assign
+        self._on_toggle_vectors = on_toggle
+
     def _on_generate_clicked(self):
         if self._on_generate:
             try:
@@ -373,6 +404,23 @@ class UIManager:
                 self._on_apply_noise(seed_val)
             except ValueError:
                 self.set_status("Invalid seed!")
+
+    def _on_assign_kinematics_clicked(self):
+        if self._on_assign_kinematics:
+            # Re-use seed entry if valid, else random
+            try:
+                seed_val = int(self._seed_entry.get())
+            except ValueError:
+                seed_val = 0  # Default if empty
+            self._on_assign_kinematics(seed_val)
+
+    def _on_toggle_vectors_clicked(self):
+        self._vectors_visible = not self._vectors_visible
+        label = "ON" if self._vectors_visible else "OFF"
+        self._toggle_vectors_button["text"] = f"Show Vectors: {label}"
+
+        if self._on_toggle_vectors:
+            self._on_toggle_vectors(self._vectors_visible)
 
     def show_progress(self, visible: bool = True):
         if visible:

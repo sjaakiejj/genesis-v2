@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Set, Dict
 import random
 import colorsys
+import math
 from shapely.geometry import Polygon, MultiPolygon, Point
 from shapely.ops import clip_by_rect, unary_union
 
@@ -26,6 +27,11 @@ class PlateData:
     centroid: np.ndarray = None  # 3D centroid point
     seed_point: np.ndarray = None  # 3D seed point for Voronoi generation
     boundary_polygon: Optional[MultiPolygon] = None  # Shapely MultiPolygon (lat/lon)
+
+    # Kinematics & Properties
+    velocity_vector: Optional[np.ndarray] = None  # 3D vector at centroid
+    crust_type: str = "Oceanic"  # "Oceanic" or "Continental"
+    rotation_pole: Optional[pygplates.FiniteRotation] = None
 
 
 class PlateManager:
@@ -56,6 +62,9 @@ class PlateManager:
 
         # Plate data for visualization
         self.plates: List[PlateData] = []
+
+        # Kinematics
+        self.rotation_model: Optional[pygplates.RotationModel] = None
 
         # Selection state
         self._selected_ids: Set[int] = set()
@@ -208,6 +217,105 @@ class PlateManager:
 
             self.plates.append(plate)
             self._plate_map[i] = plate
+
+    def assign_kinematics(self, seed: int):
+        """
+        Assign random crust types and movement vectors to plates.
+        Calculates velocity vectors using pygplates.
+        """
+        print(f"Assigning kinematics with seed {seed}")
+        # Use a local random instance or seed global
+        rng = random.Random(seed)
+
+        rotations = []
+
+        for plate in self.plates:
+            # 1. Assign Crust Type (simple random for now)
+            # 30% Continental, 70% Oceanic
+            if rng.random() < 0.3:
+                plate.crust_type = "Continental"
+            else:
+                plate.crust_type = "Oceanic"
+
+            # 2. Generate Random Euler Pole & Angle
+            # Random point on sphere for pole
+            pole_lat = rng.uniform(-90, 90)
+            pole_lon = rng.uniform(-180, 180)
+
+            # Random angular velocity (degrees per million years)
+            # Typical earth plates move ~1-10 cm/yr.
+            # 1 deg/Myr is roughly 11 cm/yr at equator.
+            angle_per_myr = rng.uniform(0.2, 1.2)
+
+            finite_rotation = pygplates.FiniteRotation(
+                pygplates.PointOnSphere(pole_lat, pole_lon),
+                math.radians(angle_per_myr),  # pygplates uses radians for angle
+            )
+            plate.rotation_pole = finite_rotation
+
+            # Create a Total Reconstruction Sequence Feature
+            # We define movement of plate_id relative to anchor 9999
+            # Sequence: Time 0 (Identity) -> Time 1 (Rotated)
+
+            # Identity at 0Ma
+            rot0 = pygplates.FiniteRotation.create_identity_rotation()
+            prop0 = pygplates.GpmlFiniteRotation(rot0)
+            sample0 = pygplates.GpmlTimeSample(prop0, 0.0)
+
+            # Rotation at 10Ma (10 * rate)
+            # Actually finite_rotation calculated above was for 1Myr "angle_per_myr"
+            # So let's define the position at 1Ma
+            rot1 = finite_rotation
+            prop1 = pygplates.GpmlFiniteRotation(rot1)
+            sample1 = pygplates.GpmlTimeSample(prop1, 1.0)
+
+            sampling = pygplates.GpmlIrregularSampling([sample0, sample1])
+
+            feature = pygplates.Feature.create_total_reconstruction_sequence(
+                9999, plate.plate_id, sampling  # Anchor plate (virtual deep mantle)
+            )
+
+            rotations.append(feature)
+
+        # Create Rotation Model
+        self.rotation_model = pygplates.RotationModel(rotations)
+
+        # 3. Calculate Velocity Vectors at Centroids
+        for plate in self.plates:
+            if plate.centroid is None:
+                continue
+
+            centroid_lat_lon = self._cartesian_to_lat_lon(plate.centroid)
+            point = pygplates.PointOnSphere(centroid_lat_lon[0], centroid_lat_lon[1])
+
+            # Calculate velocity
+            # velocity is returned as a VelocityVector
+            # We want velocity at 0Ma, representing motion over 1Myr
+            # so we calculate rotation from 1Ma to 0Ma relative to anchor 9999
+            try:
+                stage_rotation = self.rotation_model.get_rotation(
+                    0.0, plate.plate_id, 1.0, 9999
+                )
+            except pygplates.InformationModelError:
+                # Fallback or skip if not connected (shouldn't happen with our logic)
+                continue
+
+            velocity_vectors = pygplates.calculate_velocities(
+                [point],
+                stage_rotation,
+                1.0,  # time_interval_in_my
+                pygplates.VelocityUnits.cms_per_yr,
+            )
+
+            if velocity_vectors:
+                v_vec = velocity_vectors[0].to_xyz()  # 3D vector (x,y,z)
+                plate.velocity_vector = np.array(v_vec)
+
+    def _cartesian_to_lat_lon(self, v: np.ndarray) -> Tuple[float, float]:
+        v_norm = v / np.linalg.norm(v)
+        lat = np.degrees(np.arcsin(v_norm[2]))
+        lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
+        return (lat, lon)
 
     def apply_boundary_noise(self, seed: int):
         """
