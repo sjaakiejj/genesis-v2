@@ -140,6 +140,7 @@ class TectonicMapGenerator(ShowBase):
         )
         self.ui_manager.set_classify_crust_callback(self.assign_crust_types)
         self.ui_manager.set_generate_continents_callback(self.generate_continents)
+        self.ui_manager.set_simulation_callback(self.simulate_movement)
 
     def _setup_camera(self):
         """Setup camera position and orientation."""
@@ -519,6 +520,38 @@ class TectonicMapGenerator(ShowBase):
         self._is_generating = True
         self.ui_manager.set_generating(True)
         self.ui_manager.set_status("Generating continents...")
+        self.plate_renderer.start_plate_generation(
+            self.plate_manager.plates, self.plate_manager.get_selected_ids()
+        )
+
+    def simulate_movement(self, num_iterations: int):
+        """Simulate tectonic plate movement over specified iterations."""
+        if self._is_generating:
+            return
+
+        # Check if kinematics have been assigned (rotation model exists)
+        if self.plate_manager.rotation_model is None:
+            self.ui_manager.set_status("Error: Assign kinematics first (Step 3)!")
+            return
+
+        print(f"Running simulation for {num_iterations} iterations...")
+
+        # Run simulation
+        success = self.plate_manager.simulate_plate_movement(num_iterations)
+
+        if not success:
+            self.ui_manager.set_status("Simulation failed!")
+            return
+
+        # Update velocity vectors display
+        self.plate_renderer.render_velocity_vectors(
+            self.plate_manager.plates, visible=self.ui_manager._vectors_visible
+        )
+
+        # Regenerate texture to show new positions
+        self._is_generating = True
+        self.ui_manager.set_generating(True)
+        self.ui_manager.set_status("Updating plate positions...")
         self.plate_renderer.start_plate_generation(
             self.plate_manager.plates, self.plate_manager.get_selected_ids()
         )

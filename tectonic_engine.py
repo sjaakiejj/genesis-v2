@@ -1328,3 +1328,193 @@ class PlateManager:
         val += math.sin(x * 3.1 + y * 1.9 + offset) * 0.5
         val += math.cos(x * 0.8 - y * 2.7 + offset) * 0.25
         return val / 1.75  # Normalize to ~[-1, 1]
+
+    # =========================================================================
+    # SIMULATION
+    # =========================================================================
+
+    def simulate_plate_movement(
+        self, num_iterations: int = 1, time_step_myr: float = 1.0
+    ) -> bool:
+        """
+        Simulate plate movement over multiple time steps.
+
+        Uses the rotation model (from assign_kinematics) to advance plate positions.
+        Each iteration moves plates by time_step_myr million years.
+
+        Args:
+            num_iterations: Number of simulation steps to run
+            time_step_myr: Time step size in millions of years
+
+        Returns:
+            True if simulation was successful, False otherwise
+        """
+        if self.rotation_model is None:
+            print("Error: No rotation model. Run assign_kinematics first.")
+            return False
+
+        if not self.plates:
+            print("Error: No plates to simulate.")
+            return False
+
+        print(f"Simulating {num_iterations} iterations ({time_step_myr} Myr each)...")
+
+        # Track cumulative time
+        # We start at time 0 (present) and move backward in geological time
+        # But for our synthetic model, we treat it as forward motion
+        current_time = 0.0
+
+        for iteration in range(num_iterations):
+            next_time = current_time + time_step_myr
+
+            for plate in self.plates:
+                try:
+                    # Get stage rotation from current_time to next_time
+                    # In pygplates, stage rotation describes motion from older to younger time
+                    # get_rotation(to_time, plate_id, from_time, anchor_id)
+                    stage_rotation = self.rotation_model.get_rotation(
+                        current_time, plate.plate_id, next_time, 9999
+                    )
+                except pygplates.InformationModelError:
+                    # Plate not in rotation model, skip
+                    continue
+
+                # Rotate plate data
+                self._rotate_plate(plate, stage_rotation)
+
+            current_time = next_time
+            print(
+                f"  Iteration {iteration + 1}/{num_iterations} complete (t={current_time:.1f} Myr)"
+            )
+
+        print(f"Simulation complete. Total time: {current_time:.1f} Myr")
+        return True
+
+    def _rotate_plate(self, plate: PlateData, rotation: "pygplates.FiniteRotation"):
+        """
+        Apply a finite rotation to all geometry of a plate.
+
+        Rotates vertices, centroid, seed_point, boundary_polygon, and continent_polygon.
+        """
+        # 1. Rotate vertices (3D Cartesian)
+        if plate.vertices is not None and len(plate.vertices) > 0:
+            rotated_vertices = []
+            for v in plate.vertices:
+                v_rotated = self._rotate_vector(v, rotation)
+                rotated_vertices.append(v_rotated)
+            plate.vertices = np.array(rotated_vertices)
+
+        # 2. Rotate centroid
+        if plate.centroid is not None:
+            plate.centroid = self._rotate_vector(plate.centroid, rotation)
+
+        # 3. Rotate seed_point
+        if plate.seed_point is not None:
+            plate.seed_point = self._rotate_vector(plate.seed_point, rotation)
+
+        # 4. Rotate boundary_polygon (Shapely MultiPolygon in lat/lon)
+        if plate.boundary_polygon is not None:
+            plate.boundary_polygon = self._rotate_multipolygon(
+                plate.boundary_polygon, rotation
+            )
+
+        # 5. Rotate continent_polygon if present
+        if plate.continent_polygon is not None:
+            plate.continent_polygon = self._rotate_multipolygon(
+                plate.continent_polygon, rotation
+            )
+
+        # 6. Recalculate velocity vector at new centroid
+        if plate.centroid is not None and plate.rotation_pole is not None:
+            centroid_lat_lon = self._cartesian_to_lat_lon(plate.centroid)
+            point = pygplates.PointOnSphere(centroid_lat_lon[0], centroid_lat_lon[1])
+
+            try:
+                stage_rotation = self.rotation_model.get_rotation(
+                    0.0, plate.plate_id, 1.0, 9999
+                )
+                velocity_vectors = pygplates.calculate_velocities(
+                    [point],
+                    stage_rotation,
+                    1.0,
+                    pygplates.VelocityUnits.cms_per_yr,
+                )
+                if velocity_vectors:
+                    v_vec = velocity_vectors[0].to_xyz()
+                    plate.velocity_vector = np.array(v_vec)
+            except pygplates.InformationModelError:
+                pass
+
+    def _rotate_vector(
+        self, v: np.ndarray, rotation: "pygplates.FiniteRotation"
+    ) -> np.ndarray:
+        """
+        Rotate a 3D Cartesian vector using a pygplates FiniteRotation.
+        """
+        # Convert to lat/lon for pygplates
+        v_norm = v / np.linalg.norm(v)
+        lat = np.degrees(np.arcsin(v_norm[2]))
+        lon = np.degrees(np.arctan2(v_norm[1], v_norm[0]))
+
+        # Create point and rotate
+        point = pygplates.PointOnSphere(lat, lon)
+        rotated_point = rotation * point
+
+        # Convert back to Cartesian
+        rot_lat = rotated_point.to_lat_lon()[0]
+        rot_lon = rotated_point.to_lat_lon()[1]
+
+        lat_rad = np.radians(rot_lat)
+        lon_rad = np.radians(rot_lon)
+
+        x = np.cos(lat_rad) * np.cos(lon_rad) * self.radius
+        y = np.cos(lat_rad) * np.sin(lon_rad) * self.radius
+        z = np.sin(lat_rad) * self.radius
+
+        return np.array([x, y, z])
+
+    def _rotate_multipolygon(
+        self, multipoly: MultiPolygon, rotation: "pygplates.FiniteRotation"
+    ) -> MultiPolygon:
+        """
+        Rotate a Shapely MultiPolygon using a pygplates FiniteRotation.
+        Coordinates are (lon, lat).
+        """
+        result_polys = []
+
+        for poly in multipoly.geoms:
+            # Rotate exterior ring
+            exterior_coords = list(poly.exterior.coords)
+            rotated_exterior = []
+
+            for lon, lat in exterior_coords:
+                point = pygplates.PointOnSphere(lat, lon)
+                rotated_point = rotation * point
+                rot_lat, rot_lon = rotated_point.to_lat_lon()
+                rotated_exterior.append((rot_lon, rot_lat))
+
+            # Handle interior rings (holes)
+            rotated_interiors = []
+            for interior in poly.interiors:
+                interior_coords = list(interior.coords)
+                rotated_interior = []
+                for lon, lat in interior_coords:
+                    point = pygplates.PointOnSphere(lat, lon)
+                    rotated_point = rotation * point
+                    rot_lat, rot_lon = rotated_point.to_lat_lon()
+                    rotated_interior.append((rot_lon, rot_lat))
+                rotated_interiors.append(rotated_interior)
+
+            # Create rotated polygon
+            rotated_poly = Polygon(rotated_exterior, rotated_interiors)
+
+            if not rotated_poly.is_valid:
+                rotated_poly = rotated_poly.buffer(0)
+
+            if not rotated_poly.is_empty:
+                if isinstance(rotated_poly, Polygon):
+                    result_polys.append(rotated_poly)
+                elif isinstance(rotated_poly, MultiPolygon):
+                    result_polys.extend(rotated_poly.geoms)
+
+        return MultiPolygon(result_polys) if result_polys else multipoly

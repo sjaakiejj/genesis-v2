@@ -235,6 +235,27 @@ class UIManager:
         s5_height = 0.32
         self._add_section_to_layout(s5_frame, s5_content, s5_height)
 
+        # 6. Simulation Section
+        s6_frame, s6_content = self._create_section("Step 6: Simulation")
+
+        y_cursor = -0.02
+        self._create_label(s6_content, "Iterations:", (-0.14 * scale, y_cursor))
+        self._iterations_entry = self._create_entry(
+            s6_content, "10", (0.04 * scale, y_cursor)
+        )
+
+        y_cursor -= 0.07
+
+        self._simulate_button = self._create_button(
+            s6_content,
+            "Simulate Movement",
+            (0, y_cursor),
+            self._on_simulate_clicked,
+        )
+
+        s6_height = 0.18
+        self._add_section_to_layout(s6_frame, s6_content, s6_height)
+
         # --- BOTTOM PANELS ---
         # Fixed area at bottom for status/map
 
@@ -487,6 +508,21 @@ class UIManager:
                 ocean_margin = max(0.0, min(0.5, ocean_margin))
 
                 self._on_generate_continents(num_continents, coverage, ocean_margin)
+            except ValueError:
+                self.set_status("Invalid number!")
+
+    def set_simulation_callback(self, callback: Callable):
+        """Set callback for simulation."""
+        self._on_simulate = callback
+
+    def _on_simulate_clicked(self):
+        if self._on_simulate:
+            try:
+                num_iterations = int(self._iterations_entry.get())
+                if num_iterations < 1:
+                    self.set_status("Iterations must be >= 1")
+                    return
+                self._on_simulate(num_iterations)
             except ValueError:
                 self.set_status("Invalid number!")
 
