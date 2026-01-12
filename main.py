@@ -148,6 +148,10 @@ class TectonicMapGenerator(ShowBase):
         self.ui_manager.set_classify_crust_callback(self.assign_crust_types)
         self.ui_manager.set_generate_continents_callback(self.generate_continents)
         self.ui_manager.set_simulation_callback(self.simulate_movement)
+        self.ui_manager.set_toggle_plates_callback(self.toggle_plate_visibility)
+
+        # Track plate visibility state
+        self._show_plates = True
 
     def _setup_camera(self):
         """Setup camera position and orientation."""
@@ -399,7 +403,9 @@ class TectonicMapGenerator(ShowBase):
         plates = self.plate_manager.generate(num_plates)
 
         # Start async texture generation
-        self.plate_renderer.start_plate_generation(plates)
+        self.plate_renderer.start_plate_generation(
+            plates, show_plates=self._show_plates
+        )
 
         # Generate debug reference (synchronous for now, or could be threaded)
         # It's small (512x256) so should be fast enough (~0.1s)
@@ -422,7 +428,9 @@ class TectonicMapGenerator(ShowBase):
         self.ui_manager.set_status("Applying boundary noise...")
 
         self.plate_renderer.start_plate_generation(
-            self.plate_manager.plates, self.plate_manager.get_selected_ids()
+            self.plate_manager.plates,
+            self.plate_manager.get_selected_ids(),
+            show_plates=self._show_plates,
         )
 
     def merge_selected_plates(self):
@@ -445,7 +453,9 @@ class TectonicMapGenerator(ShowBase):
             self._is_generating = True
             self.ui_manager.set_status("Regenerating after merge...")
             self.plate_renderer.start_plate_generation(
-                self.plate_manager.plates, self.plate_manager.get_selected_ids()
+                self.plate_manager.plates,
+                self.plate_manager.get_selected_ids(),
+                show_plates=self._show_plates,
             )
 
             # Update reference too
@@ -490,12 +500,34 @@ class TectonicMapGenerator(ShowBase):
         self.ui_manager.set_generating(True)
         self.ui_manager.set_status("Updating crust visualization...")
         self.plate_renderer.start_plate_generation(
-            self.plate_manager.plates, self.plate_manager.get_selected_ids()
+            self.plate_manager.plates,
+            self.plate_manager.get_selected_ids(),
+            show_plates=self._show_plates,
         )
 
     def toggle_vector_visibility(self, visible: bool):
         """Toggle visibility of velocity vectors."""
         self.plate_renderer.set_vectors_visible(visible)
+
+    def toggle_plate_visibility(self, visible: bool):
+        """Toggle visibility of plate details (borders, colors).
+
+        When visible=True: Show plate colors, borders, and allow vectors
+        When visible=False: Show only ocean and continents, hide vectors too
+        """
+        self._show_plates = visible
+
+        # Hide vectors when plates are hidden
+        if not visible:
+            self.plate_renderer.set_vectors_visible(False)
+
+        # Regenerate texture with new display mode
+        if self.plate_manager.plates:
+            self.plate_renderer.start_plate_generation(
+                self.plate_manager.plates,
+                self.plate_manager.get_selected_ids(),
+                show_plates=visible,
+            )
 
     def generate_continents(
         self, num_continents: int, coverage: float = 0.7, ocean_margin: float = 0.1
@@ -529,7 +561,9 @@ class TectonicMapGenerator(ShowBase):
         self.ui_manager.set_generating(True)
         self.ui_manager.set_status("Generating continents...")
         self.plate_renderer.start_plate_generation(
-            self.plate_manager.plates, self.plate_manager.get_selected_ids()
+            self.plate_manager.plates,
+            self.plate_manager.get_selected_ids(),
+            show_plates=self._show_plates,
         )
 
     def simulate_movement(self, num_iterations: int):
@@ -661,7 +695,9 @@ class TectonicMapGenerator(ShowBase):
 
             # Force final texture update with authoritative plate state
             self.plate_renderer.start_plate_generation(
-                self.plate_manager.plates, self.plate_manager.get_selected_ids()
+                self.plate_manager.plates,
+                self.plate_manager.get_selected_ids(),
+                show_plates=self._show_plates,
             )
             return Task.cont
 
@@ -690,7 +726,9 @@ class TectonicMapGenerator(ShowBase):
 
                 # Trigger texture regeneration
                 self.plate_renderer.start_plate_generation(
-                    snapshot, self.plate_manager.get_selected_ids()
+                    snapshot,
+                    self.plate_manager.get_selected_ids(),
+                    show_plates=self._show_plates,
                 )
 
                 self._pending_snapshot = None

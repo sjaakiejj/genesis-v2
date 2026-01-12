@@ -65,12 +65,13 @@ class UIManager:
         self._texture_preview: OnscreenImage = None
         self._reference_preview: OnscreenImage = None
 
-        # Callbacks
         self._on_generate: Optional[Callable] = None
         self._on_merge: Optional[Callable] = None
         self._on_apply_noise: Optional[Callable] = None
         self._on_assign_kinematics: Optional[Callable] = None
         self._on_toggle_vectors: Optional[Callable] = None
+        self._on_toggle_plates: Optional[Callable] = None
+        self._plates_visible = True
 
         # Create UI
         self._create_sidebar()
@@ -255,6 +256,21 @@ class UIManager:
 
         s6_height = 0.18
         self._add_section_to_layout(s6_frame, s6_content, s6_height)
+
+        # 7. View Section
+        s7_frame, s7_content = self._create_section("View Options")
+
+        y_cursor = -0.02
+
+        self._toggle_plates_button = self._create_button(
+            s7_content,
+            "Show Plates: ON",
+            (0, y_cursor),
+            self._on_toggle_plates_clicked,
+        )
+
+        s7_height = 0.10
+        self._add_section_to_layout(s7_frame, s7_content, s7_height)
 
         # --- BOTTOM PANELS ---
         # Fixed area at bottom for status/map
@@ -534,6 +550,23 @@ class UIManager:
 
             if self._on_toggle_vectors:
                 self._on_toggle_vectors(self._vectors_visible)
+
+    def set_toggle_plates_callback(self, callback: Callable):
+        """Set callback for plate display toggle."""
+        self._on_toggle_plates = callback
+
+    def _on_toggle_plates_clicked(self):
+        self._plates_visible = not self._plates_visible
+        label = "ON" if self._plates_visible else "OFF"
+        self._toggle_plates_button["text"] = f"Show Plates: {label}"
+
+        # Also hide vectors when plates are hidden
+        if not self._plates_visible:
+            self._vectors_visible = False
+            self._toggle_vectors_button["text"] = "Show Vectors: OFF"
+
+        if self._on_toggle_plates:
+            self._on_toggle_plates(self._plates_visible)
 
     def show_progress(self, visible: bool = True):
         if visible:

@@ -63,6 +63,7 @@ class PlateTextureGenerator:
         self,
         plates: List["PlateData"],
         progress_callback: Optional[Callable[[GenerationProgress], None]] = None,
+        show_plates: bool = True,
     ) -> Optional[Tuple[Image.Image, Image.Image]]:
         """
         Generate equirectangular plate texture and ID map.
@@ -70,6 +71,7 @@ class PlateTextureGenerator:
         Args:
             plates: List of PlateData with vertices and colors
             progress_callback: Optional callback for progress updates
+            show_plates: If True, show plate colors/borders. If False, just ocean+continents.
 
         Returns:
             Tuple of (color_image, id_image), or None if cancelled.
@@ -91,7 +93,7 @@ class PlateTextureGenerator:
         # But for 12-50 plates it is fine.
 
         # Use vector drawing instead of pixel iteration
-        self._draw_plate_polygons(color_image, id_image, plates)
+        self._draw_plate_polygons(color_image, id_image, plates, show_plates)
 
         if progress_callback:
             progress = GenerationProgress(
@@ -105,9 +107,20 @@ class PlateTextureGenerator:
         return color_image, id_image
 
     def _draw_plate_polygons(
-        self, color_img: Image.Image, id_img: Image.Image, plates: List["PlateData"]
+        self,
+        color_img: Image.Image,
+        id_img: Image.Image,
+        plates: List["PlateData"],
+        show_plates: bool = True,
     ):
-        """Draw plate polygons onto the textures."""
+        """Draw plate polygons onto the textures.
+
+        Args:
+            color_img: Color texture to draw on
+            id_img: ID map texture
+            plates: List of plates to draw
+            show_plates: If True, draw plate colors/borders. If False, only ocean+continents.
+        """
         draw_color = ImageDraw.Draw(color_img)
         draw_id = ImageDraw.Draw(id_img)
 
@@ -124,23 +137,30 @@ class PlateTextureGenerator:
             y = (90.0 - lat) / 180.0 * self.height
             return x, y
 
-        # First pass: Draw all plate backgrounds
+        # Ocean color for simple mode
+        ocean_color = (30, 60, 90)  # Dark blue ocean
+
+        # First pass: Draw plate backgrounds (or just ocean in simple mode)
         for plate in plates:
             if not plate.boundary_polygon:
                 continue
 
-            # Color based on CrustType
-            fill_color = (
-                int(plate.color[0] * 255),
-                int(plate.color[1] * 255),
-                int(plate.color[2] * 255),
-            )
+            if show_plates:
+                # Color based on CrustType
+                fill_color = (
+                    int(plate.color[0] * 255),
+                    int(plate.color[1] * 255),
+                    int(plate.color[2] * 255),
+                )
 
-            if hasattr(plate, "crust_type") and plate.crust_type:
-                if plate.crust_type.name == "OCEANIC":
-                    fill_color = (135, 206, 235)  # Light Blue (Sky Blue)
-                elif plate.crust_type.name == "CONTINENTAL":
-                    fill_color = (144, 238, 144)  # Light Green (Pale Green)
+                if hasattr(plate, "crust_type") and plate.crust_type:
+                    if plate.crust_type.name == "OCEANIC":
+                        fill_color = (135, 206, 235)  # Light Blue (Sky Blue)
+                    elif plate.crust_type.name == "CONTINENTAL":
+                        fill_color = (144, 238, 144)  # Light Green (Pale Green)
+            else:
+                # Simple mode: everything is ocean blue (continents drawn on top)
+                fill_color = ocean_color
 
             # ID index
             idx = plate_id_to_index.get(plate.plate_id, 255)
@@ -156,7 +176,9 @@ class PlateTextureGenerator:
 
         # Second pass: Draw continents on top of continental plates
         continent_fill = (210, 180, 140)  # Tan/Brown for land
-        coastline_color = (101, 67, 33)  # Dark Brown for coastlines
+        coastline_color = (
+            (101, 67, 33) if show_plates else None
+        )  # Only show coastline in plates mode
 
         for plate in plates:
             if not hasattr(plate, "continent_polygon") or not plate.continent_polygon:
@@ -169,8 +191,9 @@ class PlateTextureGenerator:
                 # Draw filled continent
                 draw_color.polygon(pixels, fill=continent_fill)
 
-                # Draw coastline border
-                draw_color.polygon(pixels, outline=coastline_color)
+                # Draw coastline border only in plates mode
+                if coastline_color:
+                    draw_color.polygon(pixels, outline=coastline_color)
 
     def cancel(self):
         """Cancel ongoing generation."""
@@ -189,27 +212,28 @@ class ThreadedTextureGenerator:
         self._progress_queue: Queue = Queue()
         self._is_generating = False
 
-    def start_generation(self, plates: List["PlateData"]):
+    def start_generation(self, plates: List["PlateData"], show_plates: bool = True):
         """
         Start texture generation in a background thread.
 
         Args:
             plates: List of PlateData to generate texture from
+            show_plates: If True, show plate colors/borders. If False, just ocean+continents.
         """
         if self._is_generating:
             self.cancel()
 
         self._is_generating = True
         self._thread = threading.Thread(
-            target=self._generation_worker, args=(plates,), daemon=True
+            target=self._generation_worker, args=(plates, show_plates), daemon=True
         )
         self._thread.start()
 
-    def _generation_worker(self, plates: List["PlateData"]):
+    def _generation_worker(self, plates: List["PlateData"], show_plates: bool):
         """Worker thread for texture generation."""
         try:
             result = self.generator.generate_texture(
-                plates, progress_callback=self._on_progress
+                plates, progress_callback=self._on_progress, show_plates=show_plates
             )
             # result is tuple (color_image, id_image)
             self._result_queue.put(("success", result))
@@ -343,16 +367,23 @@ class PlateRenderer:
             self.globe = None
 
     def start_plate_generation(
-        self, plates: List["PlateData"], selected_ids: Optional[Set[int]] = None
+        self, plates: List["PlateData"], selected_ids: Optional[Set[int]] = None,
+        show_plates: bool = True
     ):
         """
         Start async plate texture generation.
+        
+        Args:
+            plates: List of plates to render
+            selected_ids: Set of selected plate IDs for highlighting
+            show_plates: If True, show plate colors/borders. If False, just ocean+continents.
         """
         self._plates = plates
         self._selected_ids = selected_ids or set()
+        self._show_plates = show_plates
         # Update selection texture immediately to match new plate list/indices
         self._update_selection_texture()
-        self.threaded_generator.start_generation(plates)
+        self.threaded_generator.start_generation(plates, show_plates)
         print(f"Started texture generation for {len(plates)} plates...")
 
     def refresh_selection(self, selected_ids: Set[int]):
