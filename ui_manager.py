@@ -257,20 +257,47 @@ class UIManager:
         s6_height = 0.18
         self._add_section_to_layout(s6_frame, s6_content, s6_height)
 
-        # 7. View Section
-        s7_frame, s7_content = self._create_section("View Options")
+        # 7. Feature Mapping Section
+        s7_frame, s7_content = self._create_section("Step 7: Feature Mapping")
+
+        y_cursor = -0.02
+        self._create_label(s7_content, "Volcanic Arcs %:", (-0.14 * scale, y_cursor))
+        self._volcanic_arcs_entry = self._create_entry(
+            s7_content, "50", (0.04 * scale, y_cursor)
+        )
+
+        y_cursor -= 0.06
+        self._create_label(s7_content, "Hotspots %:", (-0.14 * scale, y_cursor))
+        self._hotspots_entry = self._create_entry(
+            s7_content, "30", (0.04 * scale, y_cursor)
+        )
+
+        y_cursor -= 0.07
+
+        self._map_features_button = self._create_button(
+            s7_content,
+            "Map Features",
+            (0, y_cursor),
+            self._on_map_features_clicked,
+        )
+
+        s7_height = 0.24
+        self._add_section_to_layout(s7_frame, s7_content, s7_height)
+
+        # 8. View Section
+        s8_frame, s8_content = self._create_section("View Options")
 
         y_cursor = -0.02
 
         self._toggle_plates_button = self._create_button(
-            s7_content,
+            s8_content,
             "Show Plates: ON",
             (0, y_cursor),
             self._on_toggle_plates_clicked,
         )
 
-        s7_height = 0.10
-        self._add_section_to_layout(s7_frame, s7_content, s7_height)
+        s8_height = 0.10
+        self._add_section_to_layout(s8_frame, s8_content, s8_height)
 
         # --- BOTTOM PANELS ---
         # Fixed area at bottom for status/map
@@ -541,6 +568,24 @@ class UIManager:
                 self._on_simulate(num_iterations)
             except ValueError:
                 self.set_status("Invalid number!")
+
+    def set_map_features_callback(self, callback: Callable):
+        """Set callback for feature mapping."""
+        self._on_map_features = callback
+
+    def _on_map_features_clicked(self):
+        if self._on_map_features:
+            try:
+                volcanic_arcs_pct = int(self._volcanic_arcs_entry.get()) / 100.0
+                hotspots_pct = int(self._hotspots_entry.get()) / 100.0
+
+                # Clamp values
+                volcanic_arcs_pct = max(0.0, min(1.0, volcanic_arcs_pct))
+                hotspots_pct = max(0.0, min(1.0, hotspots_pct))
+
+                self._on_map_features(volcanic_arcs_pct, hotspots_pct)
+            except ValueError:
+                self.set_status("Invalid percentage!")
 
     def _on_toggle_vectors_clicked(self):
         if self._on_toggle_vectors:

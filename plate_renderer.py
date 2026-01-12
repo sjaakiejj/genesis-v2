@@ -195,6 +195,126 @@ class PlateTextureGenerator:
                 if coastline_color:
                     draw_color.polygon(pixels, outline=coastline_color)
 
+        # Third pass: Draw tectonic features
+        self._draw_features(draw_color, plates, to_pixels)
+
+    def _draw_features(self, draw, plates, to_pixels):
+        """Draw tectonic features like volcanic arcs, hotspots, mountains, ridges."""
+        # Feature colors
+        volcanic_arc_color = (255, 69, 0)  # Red-Orange for volcanic arcs
+        hotspot_color = (255, 0, 0)  # Red for hotspots
+        mountain_color = (139, 90, 43)  # Saddle brown for mountains
+        ridge_color = (255, 140, 0)  # Dark orange for ridges
+
+        for plate in plates:
+            if not hasattr(plate, "features") or not plate.features:
+                continue
+
+            for feature in plate.features:
+                if feature.feature_type == "volcanic_arc" and feature.line:
+                    # Draw volcanic arc as line of triangles
+                    self._draw_line_feature(
+                        draw, feature.line, to_pixels, volcanic_arc_color, width=2
+                    )
+                    # Add triangle markers along the line
+                    self._draw_volcano_markers(
+                        draw, feature.line, to_pixels, volcanic_arc_color
+                    )
+
+                elif feature.feature_type == "hotspot" and feature.location is not None:
+                    # Draw hotspot as a red dot
+                    # Convert 3D to lat/lon
+                    x, y, z = feature.location
+                    r = (x**2 + y**2 + z**2) ** 0.5
+                    lat = math.degrees(math.asin(z / r))
+                    lon = math.degrees(math.atan2(y, x))
+                    px, py = to_pixels(lon, lat)
+                    # Draw filled circle
+                    radius = 4
+                    draw.ellipse(
+                        [px - radius, py - radius, px + radius, py + radius],
+                        fill=hotspot_color,
+                        outline=(200, 0, 0),
+                    )
+
+                elif feature.feature_type == "mountain_range" and feature.line:
+                    # Draw mountain range as thick brown line
+                    self._draw_line_feature(
+                        draw, feature.line, to_pixels, mountain_color, width=4
+                    )
+
+                elif feature.feature_type == "ridge" and feature.line:
+                    # Draw mid-ocean ridge as orange line
+                    self._draw_line_feature(
+                        draw, feature.line, to_pixels, ridge_color, width=2
+                    )
+
+                elif feature.feature_type == "mountain_plateau" and feature.polygon:
+                    # Draw mountain plateau as dark gray/brown filled polygon
+                    plateau_color = (120, 100, 80)  # Dark grayish brown
+                    self._draw_polygon_feature(
+                        draw, feature.polygon, to_pixels, plateau_color
+                    )
+
+    def _draw_line_feature(self, draw, geom, to_pixels, color, width=2):
+        """Draw a line or multiline feature."""
+        if hasattr(geom, "geom_type"):
+            if geom.geom_type == "LineString":
+                coords = list(geom.coords)
+                if len(coords) >= 2:
+                    pixels = [to_pixels(lon, lat) for lon, lat in coords]
+                    draw.line(pixels, fill=color, width=width)
+            elif geom.geom_type == "MultiLineString":
+                for line in geom.geoms:
+                    coords = list(line.coords)
+                    if len(coords) >= 2:
+                        pixels = [to_pixels(lon, lat) for lon, lat in coords]
+                        draw.line(pixels, fill=color, width=width)
+
+    def _draw_volcano_markers(self, draw, geom, to_pixels, color, spacing=30):
+        """Draw small triangle markers along a line to represent volcanoes."""
+        import math
+
+        def draw_triangle(cx, cy, size=5):
+            """Draw a small triangle at (cx, cy)."""
+            points = [
+                (cx, cy - size),  # Top
+                (cx - size, cy + size),  # Bottom left
+                (cx + size, cy + size),  # Bottom right
+            ]
+            draw.polygon(points, fill=color)
+
+        if hasattr(geom, "geom_type"):
+            if geom.geom_type == "LineString":
+                coords = list(geom.coords)
+                # Draw markers at intervals
+                for i in range(0, len(coords), max(1, len(coords) // 5)):
+                    lon, lat = coords[i]
+                    px, py = to_pixels(lon, lat)
+                    draw_triangle(px, py)
+            elif geom.geom_type == "MultiLineString":
+                for line in geom.geoms:
+                    coords = list(line.coords)
+                    for i in range(0, len(coords), max(1, len(coords) // 3)):
+                        lon, lat = coords[i]
+                        px, py = to_pixels(lon, lat)
+                        draw_triangle(px, py)
+
+    def _draw_polygon_feature(self, draw, geom, to_pixels, color):
+        """Draw a filled polygon feature (for plateaus, etc)."""
+        if hasattr(geom, "geom_type"):
+            if geom.geom_type == "Polygon":
+                coords = list(geom.exterior.coords)
+                if len(coords) >= 3:
+                    pixels = [to_pixels(lon, lat) for lon, lat in coords]
+                    draw.polygon(pixels, fill=color, outline=(80, 60, 40))
+            elif geom.geom_type == "MultiPolygon":
+                for poly in geom.geoms:
+                    coords = list(poly.exterior.coords)
+                    if len(coords) >= 3:
+                        pixels = [to_pixels(lon, lat) for lon, lat in coords]
+                        draw.polygon(pixels, fill=color, outline=(80, 60, 40))
+
     def cancel(self):
         """Cancel ongoing generation."""
         self._cancel_flag = True
@@ -359,6 +479,7 @@ class PlateRenderer:
         self.globe.setShaderInput("selection_tex", self._selection_tex)
         self.globe.setShaderInput("vector_tex", self._vector_tex)
         self.globe.setShaderInput("show_vectors", 1.0)
+        self.globe.setShaderInput("show_borders", 1.0)
 
     def clear(self):
         """Remove existing globe geometry."""
@@ -367,12 +488,14 @@ class PlateRenderer:
             self.globe = None
 
     def start_plate_generation(
-        self, plates: List["PlateData"], selected_ids: Optional[Set[int]] = None,
-        show_plates: bool = True
+        self,
+        plates: List["PlateData"],
+        selected_ids: Optional[Set[int]] = None,
+        show_plates: bool = True,
     ):
         """
         Start async plate texture generation.
-        
+
         Args:
             plates: List of plates to render
             selected_ids: Set of selected plate IDs for highlighting
@@ -620,6 +743,12 @@ class PlateRenderer:
         if self.globe:
             val = 1.0 if visible else 0.0
             self.globe.setShaderInput("show_vectors", val)
+
+    def set_borders_visible(self, visible: bool):
+        """Toggle visibility of plate borders."""
+        if self.globe:
+            val = 1.0 if visible else 0.0
+            self.globe.setShaderInput("show_borders", val)
 
     def render_velocity_vectors(self, plates: List["PlateData"], visible: bool = True):
         """

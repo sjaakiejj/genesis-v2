@@ -14,13 +14,45 @@ from enum import Enum, auto
 import random
 import colorsys
 import math
-from shapely.geometry import Polygon, MultiPolygon, Point
+from shapely.geometry import Polygon, MultiPolygon, Point, LineString
 from shapely.ops import clip_by_rect, unary_union
 
 
 class CrustType(Enum):
     OCEANIC = auto()
     CONTINENTAL = auto()
+
+
+class BoundaryType(Enum):
+    """Type of plate boundary based on relative motion."""
+
+    CONVERGENT = auto()  # Plates colliding - mountains, trenches, volcanoes
+    DIVERGENT = auto()  # Plates separating - ridges, rift valleys
+    TRANSFORM = auto()  # Plates sliding - earthquakes, no major landforms
+
+
+@dataclass
+class BoundarySegment:
+    """Represents a segment of plate boundary with its characteristics."""
+
+    plate_a_id: int
+    plate_b_id: int
+    boundary_type: BoundaryType
+    geometry: Any  # Shapely LineString in (lon, lat)
+    is_subduction: bool = False  # True if one plate subducts under another
+    subducting_plate_id: Optional[int] = None
+    overriding_plate_id: Optional[int] = None
+
+
+@dataclass
+class TectonicFeature:
+    """Point or polygon feature like volcanoes, hotspots, mountain ranges."""
+
+    feature_type: str  # "volcanic_arc", "hotspot", "mountain_range", "trench", "ridge"
+    location: Optional[np.ndarray] = None  # 3D cartesian for point features
+    polygon: Optional[MultiPolygon] = None  # For area features like mountains
+    line: Any = None  # For linear features like ridges/trenches
+    parent_plate_id: Optional[int] = None
 
 
 @dataclass
@@ -39,6 +71,9 @@ class PlateData:
     crust_type: Optional[CrustType] = None
     continent_polygon: Optional[MultiPolygon] = None
     feature: Optional["pygplates.Feature"] = None
+    # Feature mapping
+    boundary_segments: List[BoundarySegment] = field(default_factory=list)
+    features: List[TectonicFeature] = field(default_factory=list)
 
 
 class PlateManager:
@@ -1335,6 +1370,437 @@ class PlateManager:
         val += math.sin(x * 3.1 + y * 1.9 + offset) * 0.5
         val += math.cos(x * 0.8 - y * 2.7 + offset) * 0.25
         return val / 1.75  # Normalize to ~[-1, 1]
+
+    # =========================================================================
+    # FEATURE MAPPING
+    # =========================================================================
+
+    def analyze_boundaries(self) -> List[BoundarySegment]:
+        """
+        Analyze all plate boundaries to determine their type.
+
+        For each pair of neighboring plates:
+        1. Get their boundary line (shared edge)
+        2. Calculate relative velocity at boundary midpoint
+        3. Classify as convergent/divergent/transform based on velocity dot product
+        4. For convergent, determine subduction (oceanic under continental)
+
+        Returns:
+            List of BoundarySegment objects describing each boundary
+        """
+        segments = []
+        processed_pairs = set()
+
+        for plate in self.plates:
+            plate.boundary_segments = []  # Clear existing
+
+            for neighbor_id in self._neighbors.get(plate.plate_id, set()):
+                # Avoid processing same pair twice
+                pair_key = tuple(sorted([plate.plate_id, neighbor_id]))
+                if pair_key in processed_pairs:
+                    continue
+                processed_pairs.add(pair_key)
+
+                neighbor = self._plate_map.get(neighbor_id)
+                if not neighbor:
+                    continue
+
+                # Get boundary geometry
+                boundary_line = self._get_shared_boundary(plate, neighbor)
+                if boundary_line is None or boundary_line.is_empty:
+                    continue
+
+                print(
+                    f"  Found boundary between plate {plate.plate_id} and {neighbor_id} (length: {boundary_line.length:.1f})"
+                )
+
+                # Classify boundary type
+                boundary_type, is_subduction, subducting_id, overriding_id = (
+                    self._classify_boundary(plate, neighbor, boundary_line)
+                )
+
+                segment = BoundarySegment(
+                    plate_a_id=plate.plate_id,
+                    plate_b_id=neighbor_id,
+                    boundary_type=boundary_type,
+                    geometry=boundary_line,
+                    is_subduction=is_subduction,
+                    subducting_plate_id=subducting_id,
+                    overriding_plate_id=overriding_id,
+                )
+
+                segments.append(segment)
+                plate.boundary_segments.append(segment)
+                neighbor.boundary_segments.append(segment)
+
+        # Count boundary types
+        conv = sum(1 for s in segments if s.boundary_type == BoundaryType.CONVERGENT)
+        div = sum(1 for s in segments if s.boundary_type == BoundaryType.DIVERGENT)
+        trans = sum(1 for s in segments if s.boundary_type == BoundaryType.TRANSFORM)
+        sub = sum(1 for s in segments if s.is_subduction)
+
+        print(
+            f"Analyzed {len(segments)} boundaries: {conv} convergent ({sub} subduction), {div} divergent, {trans} transform"
+        )
+
+        return segments
+
+    def _get_shared_boundary(
+        self, plate_a: PlateData, plate_b: PlateData
+    ) -> Optional[LineString]:
+        """Get the shared boundary line between two plates.
+
+        Uses a buffer-based approach that's more robust than direct intersection.
+        """
+        if not plate_a.boundary_polygon or not plate_b.boundary_polygon:
+            return None
+
+        try:
+            from shapely.geometry import MultiLineString
+            from shapely.ops import linemerge
+
+            # Get the exterior boundaries as linestrings
+            def get_boundary_lines(poly):
+                if hasattr(poly, "geoms"):
+                    lines = []
+                    for p in poly.geoms:
+                        lines.append(LineString(p.exterior.coords))
+                    return (
+                        MultiLineString(lines)
+                        if len(lines) > 1
+                        else (lines[0] if lines else None)
+                    )
+                else:
+                    return LineString(poly.exterior.coords)
+
+            boundary_a = get_boundary_lines(plate_a.boundary_polygon)
+            boundary_b = get_boundary_lines(plate_b.boundary_polygon)
+
+            if boundary_a is None or boundary_b is None:
+                return None
+
+            # Buffer the boundaries slightly and find intersection
+            # This handles cases where boundaries don't exactly touch
+            buffer_dist = 0.5  # degrees
+            buffered_a = boundary_a.buffer(buffer_dist)
+
+            # Get the portion of boundary_b that's within the buffered area
+            shared = boundary_b.intersection(buffered_a)
+
+            if shared.is_empty:
+                return None
+
+            # Convert to LineString if possible
+            if shared.geom_type == "LineString":
+                return shared if shared.length > 1.0 else None
+            elif shared.geom_type == "MultiLineString":
+                # Return the longest segment
+                valid_lines = [g for g in shared.geoms if g.length > 1.0]
+                if valid_lines:
+                    longest = max(valid_lines, key=lambda g: g.length)
+                    return longest
+            elif shared.geom_type == "GeometryCollection":
+                lines = [
+                    g
+                    for g in shared.geoms
+                    if g.geom_type == "LineString" and g.length > 1.0
+                ]
+                if lines:
+                    return max(lines, key=lambda g: g.length)
+
+            return None
+        except Exception as e:
+            print(f"Error getting shared boundary: {e}")
+            return None
+
+    def _classify_boundary(
+        self, plate_a: PlateData, plate_b: PlateData, boundary: LineString
+    ) -> Tuple[BoundaryType, bool, Optional[int], Optional[int]]:
+        """
+        Classify the boundary between two plates based on relative motion.
+
+        Returns:
+            (boundary_type, is_subduction, subducting_plate_id, overriding_plate_id)
+        """
+        # Get midpoint of boundary for velocity calculation
+        if hasattr(boundary, "centroid"):
+            midpoint = boundary.centroid
+            mid_lon, mid_lat = midpoint.x, midpoint.y
+        else:
+            mid_lon, mid_lat = 0, 0
+
+        # Get velocity vectors (already in 3D cartesian)
+        v_a = plate_a.velocity_vector
+        v_b = plate_b.velocity_vector
+
+        if v_a is None or v_b is None:
+            return BoundaryType.TRANSFORM, False, None, None
+
+        # Get centroid positions for direction calculation
+        if plate_a.centroid is None or plate_b.centroid is None:
+            return BoundaryType.TRANSFORM, False, None, None
+
+        # Calculate relative velocity
+        v_rel = v_a - v_b
+
+        # Calculate direction from A to B (approximate boundary normal)
+        direction = plate_b.centroid - plate_a.centroid
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+
+        # Dot product tells us if plates are moving toward or away from each other
+        # Positive = converging, Negative = diverging
+        dot_product = np.dot(v_rel, direction)
+
+        # Threshold for classification (cm/yr)
+        convergent_threshold = 0.3
+        divergent_threshold = -0.3
+
+        if dot_product > convergent_threshold:
+            boundary_type = BoundaryType.CONVERGENT
+        elif dot_product < divergent_threshold:
+            boundary_type = BoundaryType.DIVERGENT
+        else:
+            boundary_type = BoundaryType.TRANSFORM
+
+        # Determine subduction for convergent boundaries
+        is_subduction = False
+        subducting_id = None
+        overriding_id = None
+
+        if boundary_type == BoundaryType.CONVERGENT:
+            crust_a = plate_a.crust_type
+            crust_b = plate_b.crust_type
+
+            # Subduction rules:
+            # - Oceanic under Continental always subducts
+            # - Oceanic under Oceanic: random choice (older/denser subducts)
+            # - Continental under Continental: no subduction (collision zone)
+
+            if crust_a == CrustType.OCEANIC and crust_b == CrustType.CONTINENTAL:
+                is_subduction = True
+                subducting_id = plate_a.plate_id
+                overriding_id = plate_b.plate_id
+            elif crust_a == CrustType.CONTINENTAL and crust_b == CrustType.OCEANIC:
+                is_subduction = True
+                subducting_id = plate_b.plate_id
+                overriding_id = plate_a.plate_id
+            elif crust_a == CrustType.OCEANIC and crust_b == CrustType.OCEANIC:
+                # Both oceanic - random choice for now
+                is_subduction = True
+                if random.random() < 0.5:
+                    subducting_id = plate_a.plate_id
+                    overriding_id = plate_b.plate_id
+                else:
+                    subducting_id = plate_b.plate_id
+                    overriding_id = plate_a.plate_id
+            # Continental-Continental: no subduction, just collision
+
+        return boundary_type, is_subduction, subducting_id, overriding_id
+
+    def generate_features(
+        self, volcanic_arc_pct: float = 0.5, hotspot_pct: float = 0.3
+    ):
+        """
+        Generate tectonic features based on boundary analysis.
+
+        Args:
+            volcanic_arc_pct: Percentage (0-1) of subduction zones to add volcanic arcs
+            hotspot_pct: Percentage (0-1) of plates to add hotspots
+        """
+        # First, analyze boundaries if not already done
+        if not any(plate.boundary_segments for plate in self.plates):
+            self.analyze_boundaries()
+
+        # Clear existing features
+        for plate in self.plates:
+            plate.features = []
+
+        # Collect all boundary segments
+        all_segments = []
+        for plate in self.plates:
+            all_segments.extend(plate.boundary_segments)
+        # Remove duplicates (each segment is in both plates' lists)
+        unique_segments = []
+        seen = set()
+        for seg in all_segments:
+            key = tuple(sorted([seg.plate_a_id, seg.plate_b_id]))
+            if key not in seen:
+                seen.add(key)
+                unique_segments.append(seg)
+
+        # Generate features at subduction zones
+        subduction_segments = [s for s in unique_segments if s.is_subduction]
+        num_arcs = int(len(subduction_segments) * volcanic_arc_pct)
+        arc_segments = random.sample(
+            subduction_segments, min(num_arcs, len(subduction_segments))
+        )
+
+        for seg in arc_segments:
+            # Create volcanic arc on the overriding plate side
+            overriding_plate = self._plate_map.get(seg.overriding_plate_id)
+            if overriding_plate:
+                arc_feature = TectonicFeature(
+                    feature_type="volcanic_arc",
+                    line=seg.geometry,
+                    parent_plate_id=seg.overriding_plate_id,
+                )
+                overriding_plate.features.append(arc_feature)
+
+        # Generate hotspots in plate interiors
+        num_hotspots = int(len(self.plates) * hotspot_pct)
+        hotspot_plates = random.sample(self.plates, min(num_hotspots, len(self.plates)))
+
+        for plate in hotspot_plates:
+            if plate.centroid is not None:
+                # Place hotspot near centroid with some random offset
+                offset = np.random.randn(3) * 0.1 * self.radius
+                location = plate.centroid + offset
+                location = location / np.linalg.norm(location) * self.radius
+
+                hotspot_feature = TectonicFeature(
+                    feature_type="hotspot",
+                    location=location,
+                    parent_plate_id=plate.plate_id,
+                )
+                plate.features.append(hotspot_feature)
+
+        # Generate mountain ranges at continental-continental convergent boundaries
+        for seg in unique_segments:
+            if seg.boundary_type == BoundaryType.CONVERGENT and not seg.is_subduction:
+                # This is a continental collision zone - create mountain range
+                plate_a = self._plate_map.get(seg.plate_a_id)
+                plate_b = self._plate_map.get(seg.plate_b_id)
+
+                if plate_a and plate_b:
+                    mountain_feature = TectonicFeature(
+                        feature_type="mountain_range",
+                        line=seg.geometry,
+                        parent_plate_id=seg.plate_a_id,
+                    )
+                    plate_a.features.append(mountain_feature)
+
+        # Generate mid-ocean ridges at divergent boundaries in ocean
+        for seg in unique_segments:
+            if seg.boundary_type == BoundaryType.DIVERGENT:
+                plate_a = self._plate_map.get(seg.plate_a_id)
+                plate_b = self._plate_map.get(seg.plate_b_id)
+
+                # Check if both plates are oceanic
+                if (
+                    plate_a
+                    and plate_b
+                    and plate_a.crust_type == CrustType.OCEANIC
+                    and plate_b.crust_type == CrustType.OCEANIC
+                ):
+                    ridge_feature = TectonicFeature(
+                        feature_type="ridge",
+                        line=seg.geometry,
+                        parent_plate_id=seg.plate_a_id,
+                    )
+                    plate_a.features.append(ridge_feature)
+
+        # Detect overlapping plates and create mountain plateaus
+        # This is important for plates that have collided during simulation
+        self._generate_overlap_mountains()
+
+        # Count features
+        total_arcs = sum(
+            1
+            for p in self.plates
+            for f in p.features
+            if f.feature_type == "volcanic_arc"
+        )
+        total_hotspots = sum(
+            1 for p in self.plates for f in p.features if f.feature_type == "hotspot"
+        )
+        total_mountains = sum(
+            1
+            for p in self.plates
+            for f in p.features
+            if f.feature_type == "mountain_range"
+        )
+        total_plateaus = sum(
+            1
+            for p in self.plates
+            for f in p.features
+            if f.feature_type == "mountain_plateau"
+        )
+        total_ridges = sum(
+            1 for p in self.plates for f in p.features if f.feature_type == "ridge"
+        )
+
+        print(
+            f"Generated features: {total_arcs} volcanic arcs, {total_hotspots} hotspots, "
+            f"{total_mountains} mountain ranges, {total_plateaus} plateaus, {total_ridges} ridges"
+        )
+
+    def _generate_overlap_mountains(self):
+        """
+        Detect overlapping plate polygons and create mountain plateaus.
+
+        When continental plates collide and overlap during simulation,
+        the overlapping region becomes elevated terrain (like Tibet/Himalayas).
+        """
+        # Only check continental plates for collision mountains
+        continental_plates = [
+            p for p in self.plates if p.crust_type == CrustType.CONTINENTAL
+        ]
+
+        processed_pairs = set()
+        overlap_count = 0
+
+        for i, plate_a in enumerate(continental_plates):
+            if not plate_a.boundary_polygon:
+                continue
+
+            for plate_b in continental_plates[i + 1 :]:
+                if not plate_b.boundary_polygon:
+                    continue
+
+                pair_key = tuple(sorted([plate_a.plate_id, plate_b.plate_id]))
+                if pair_key in processed_pairs:
+                    continue
+                processed_pairs.add(pair_key)
+
+                try:
+                    # Check for actual polygon intersection (not just adjacent)
+                    intersection = plate_a.boundary_polygon.intersection(
+                        plate_b.boundary_polygon
+                    )
+
+                    if intersection.is_empty:
+                        continue
+
+                    # Must be a polygon (area), not just a line (boundary)
+                    if intersection.geom_type in ("Polygon", "MultiPolygon"):
+                        area = intersection.area
+
+                        # Only count significant overlaps (>1 sq degree)
+                        if area > 1.0:
+                            overlap_count += 1
+                            print(
+                                f"  Overlap found: plates {plate_a.plate_id} & {plate_b.plate_id} (area: {area:.1f})"
+                            )
+
+                            # Create mountain plateau feature
+                            if intersection.geom_type == "Polygon":
+                                plateau_poly = MultiPolygon([intersection])
+                            else:
+                                plateau_poly = intersection
+
+                            plateau_feature = TectonicFeature(
+                                feature_type="mountain_plateau",
+                                polygon=plateau_poly,
+                                parent_plate_id=plate_a.plate_id,
+                            )
+                            plate_a.features.append(plateau_feature)
+
+                except Exception as e:
+                    print(f"Error checking overlap: {e}")
+                    continue
+
+        if overlap_count > 0:
+            print(f"Found {overlap_count} overlapping plate regions")
 
     # =========================================================================
     # SIMULATION

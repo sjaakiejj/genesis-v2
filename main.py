@@ -149,6 +149,7 @@ class TectonicMapGenerator(ShowBase):
         self.ui_manager.set_generate_continents_callback(self.generate_continents)
         self.ui_manager.set_simulation_callback(self.simulate_movement)
         self.ui_manager.set_toggle_plates_callback(self.toggle_plate_visibility)
+        self.ui_manager.set_map_features_callback(self.map_features)
 
         # Track plate visibility state
         self._show_plates = True
@@ -517,9 +518,12 @@ class TectonicMapGenerator(ShowBase):
         """
         self._show_plates = visible
 
-        # Hide vectors when plates are hidden
+        # Hide vectors and borders when plates are hidden
         if not visible:
             self.plate_renderer.set_vectors_visible(False)
+            self.plate_renderer.set_borders_visible(False)
+        else:
+            self.plate_renderer.set_borders_visible(True)
 
         # Regenerate texture with new display mode
         if self.plate_manager.plates:
@@ -560,6 +564,45 @@ class TectonicMapGenerator(ShowBase):
         self._is_generating = True
         self.ui_manager.set_generating(True)
         self.ui_manager.set_status("Generating continents...")
+        self.plate_renderer.start_plate_generation(
+            self.plate_manager.plates,
+            self.plate_manager.get_selected_ids(),
+            show_plates=self._show_plates,
+        )
+
+    def map_features(self, volcanic_arc_pct: float, hotspot_pct: float):
+        """Map tectonic features based on plate boundary analysis.
+
+        Args:
+            volcanic_arc_pct: Percentage (0-1) of subduction zones to add volcanic arcs
+            hotspot_pct: Percentage (0-1) of plates to add hotspots
+        """
+        if self._is_generating:
+            return
+
+        # Check if kinematics have been assigned (required for boundary analysis)
+        if self.plate_manager.rotation_model is None:
+            self.ui_manager.set_status("Error: Assign kinematics first (Step 3)!")
+            return
+
+        # Check if crust types have been assigned
+        if not any(p.crust_type for p in self.plate_manager.plates):
+            self.ui_manager.set_status("Error: Classify crust types first (Step 4)!")
+            return
+
+        print(
+            f"Mapping tectonic features (arcs={volcanic_arc_pct:.0%}, hotspots={hotspot_pct:.0%})..."
+        )
+        self.ui_manager.set_status("Analyzing boundaries...")
+
+        # Analyze boundaries and generate features
+        self.plate_manager.analyze_boundaries()
+        self.plate_manager.generate_features(volcanic_arc_pct, hotspot_pct)
+
+        # Regenerate texture to show features
+        self._is_generating = True
+        self.ui_manager.set_generating(True)
+        self.ui_manager.set_status("Rendering features...")
         self.plate_renderer.start_plate_generation(
             self.plate_manager.plates,
             self.plate_manager.get_selected_ids(),
