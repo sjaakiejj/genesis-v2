@@ -583,6 +583,13 @@ class PlateManager:
             except Exception as e:
                 pass
 
+        # Merge any overlapping fragments to prevent duplicate geometry artifacts
+        if polys:
+            merged = unary_union(polys)
+            if isinstance(merged, Polygon):
+                return MultiPolygon([merged])
+            elif isinstance(merged, MultiPolygon):
+                return merged
         return MultiPolygon(polys)
 
     def _apply_noise_to_vector(self, v: np.ndarray, seed: int) -> np.ndarray:
@@ -1581,7 +1588,16 @@ class PlateManager:
                 except Exception:
                     pass
 
-        return MultiPolygon(result_polys) if result_polys else multipoly
+        # Merge any overlapping fragments to prevent duplicate geometry artifacts
+        if result_polys:
+            merged = unary_union(result_polys)
+            if isinstance(merged, Polygon):
+                return MultiPolygon([merged])
+            elif isinstance(merged, MultiPolygon):
+                return merged
+            else:
+                return multipoly
+        return multipoly
 
     def _rotate_ring(
         self, coords: List[Tuple[float, float]], rotation: "pygplates.FiniteRotation"
