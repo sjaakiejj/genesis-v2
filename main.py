@@ -150,9 +150,13 @@ class TectonicMapGenerator(ShowBase):
         self.ui_manager.set_simulation_callback(self.simulate_movement)
         self.ui_manager.set_toggle_plates_callback(self.toggle_plate_visibility)
         self.ui_manager.set_map_features_callback(self.map_features)
+        self.ui_manager.set_paint_elevation_callback(self.paint_elevation)
+        self.ui_manager.set_toggle_elevation_callback(self.toggle_elevation_visibility)
+        self.ui_manager.set_export_callback(self.export_maps)
 
         # Track plate visibility state
         self._show_plates = True
+        self._elevation_image = None  # Will store generated elevation map
 
     def _setup_camera(self):
         """Setup camera position and orientation."""
@@ -608,6 +612,81 @@ class TectonicMapGenerator(ShowBase):
             self.plate_manager.get_selected_ids(),
             show_plates=self._show_plates,
         )
+
+    def paint_elevation(self):
+        """Generate elevation map from plate and feature data."""
+        if self._is_generating:
+            return
+
+        # Check if features have been mapped
+        has_features = any(
+            hasattr(p, "features") and p.features for p in self.plate_manager.plates
+        )
+        if not has_features:
+            self.ui_manager.set_status("Error: Map features first (Step 7)!")
+            return
+
+        print("Generating elevation map...")
+        self.ui_manager.set_status("Painting elevation...")
+
+        # Import and use elevation generator
+        from elevation_generator import ElevationMapGenerator
+
+        generator = ElevationMapGenerator(width=2048, height=1024)
+        self._elevation_image = generator.generate(self.plate_manager.plates)
+
+        # Apply to renderer
+        self.plate_renderer.set_elevation_texture(self._elevation_image)
+
+        self.ui_manager.set_status("Elevation map ready!")
+        print("Elevation map generated successfully")
+
+    def toggle_elevation_visibility(self, visible: bool):
+        """Toggle between plate view and elevation view."""
+        if self._elevation_image is None:
+            self.ui_manager.set_status("Error: Paint elevation first!")
+            return
+
+        self.plate_renderer.set_elevation_visible(visible)
+
+    def export_maps(self):
+        """Export elevation map and plates-off view as PNG files."""
+        import os
+        from datetime import datetime
+
+        # Create exports directory
+        export_dir = os.path.join(os.path.dirname(__file__), "exports")
+        os.makedirs(export_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        exported = []
+
+        # Export elevation map if available
+        if self._elevation_image:
+            elevation_path = os.path.join(export_dir, f"elevation_{timestamp}.png")
+            self._elevation_image.save(elevation_path)
+            exported.append(f"elevation_{timestamp}.png")
+            print(f"Exported: {elevation_path}")
+
+        # Export simple view (plates off)
+        if self.plate_manager.plates:
+            # Generate simple view texture
+            from plate_renderer import PlateTextureGenerator
+
+            generator = PlateTextureGenerator()
+            color_img, _ = generator.generate_texture(
+                self.plate_manager.plates, show_plates=False
+            )
+            simple_path = os.path.join(export_dir, f"simple_view_{timestamp}.png")
+            color_img.save(simple_path)
+            exported.append(f"simple_view_{timestamp}.png")
+            print(f"Exported: {simple_path}")
+
+        if exported:
+            self.ui_manager.set_status(f"Exported {len(exported)} maps to exports/")
+        else:
+            self.ui_manager.set_status("Nothing to export!")
 
     def simulate_movement(self, num_iterations: int):
         """Simulate tectonic plate movement over specified iterations."""

@@ -475,6 +475,16 @@ class PlateRenderer:
         img_v.alphaFill(0)
         self._vector_tex.load(img_v)
 
+        # Initialize elevation texture
+        self._elevation_tex = Texture("elevation_texture")
+        self._elevation_tex.setup2dTexture(
+            2048, 1024, Texture.T_unsigned_byte, Texture.F_rgb
+        )
+        self._elevation_tex.setWrapU(Texture.WMRepeat)
+        self._elevation_tex.setWrapV(Texture.WMClamp)
+        self._elevation_visible = False
+        self._has_elevation = False
+
         # Bind textures to shader input
         self.globe.setShaderInput("selection_tex", self._selection_tex)
         self.globe.setShaderInput("vector_tex", self._vector_tex)
@@ -749,6 +759,35 @@ class PlateRenderer:
         if self.globe:
             val = 1.0 if visible else 0.0
             self.globe.setShaderInput("show_borders", val)
+
+    def set_elevation_visible(self, visible: bool):
+        """Toggle between normal view and elevation map view."""
+        self._elevation_visible = visible
+        if self.globe and self._has_elevation:
+            if visible:
+                # Switch to elevation texture
+                self.globe.setTexture(self._elevation_tex, 1)
+                self.globe.setShaderInput("show_borders", 0.0)
+                self.globe.setShaderInput("show_vectors", 0.0)
+            else:
+                # Switch back to plate texture
+                self.globe.setTexture(self._color_tex, 1)
+
+    def set_elevation_texture(self, pil_image):
+        """Set the elevation map texture from a PIL Image."""
+        from PIL import Image
+
+        width, height = pil_image.size
+
+        pnm = PNMImage(width, height, 3)
+        for y in range(height):
+            for x in range(width):
+                r, g, b = pil_image.getpixel((x, y))[:3]
+                pnm.setXel(x, y, r / 255.0, g / 255.0, b / 255.0)
+
+        self._elevation_tex.load(pnm)
+        self._has_elevation = True
+        print(f"Loaded elevation texture ({width}x{height})")
 
     def render_velocity_vectors(self, plates: List["PlateData"], visible: bool = True):
         """

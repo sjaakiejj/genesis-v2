@@ -284,20 +284,51 @@ class UIManager:
         s7_height = 0.24
         self._add_section_to_layout(s7_frame, s7_content, s7_height)
 
-        # 8. View Section
-        s8_frame, s8_content = self._create_section("View Options")
+        # 8. Elevation Section
+        s8_frame, s8_content = self._create_section("Step 8: Elevation")
+
+        y_cursor = -0.02
+        self._paint_elevation_button = self._create_button(
+            s8_content,
+            "Paint Elevation",
+            (0, y_cursor),
+            self._on_paint_elevation_clicked,
+        )
+
+        y_cursor -= 0.06
+        self._toggle_elevation_button = self._create_button(
+            s8_content,
+            "Show Elevation: OFF",
+            (0, y_cursor),
+            self._on_toggle_elevation_clicked,
+        )
+        self._elevation_visible = False
+
+        y_cursor -= 0.06
+        self._export_button = self._create_button(
+            s8_content,
+            "Export Maps",
+            (0, y_cursor),
+            self._on_export_clicked,
+        )
+
+        s8_height = 0.24
+        self._add_section_to_layout(s8_frame, s8_content, s8_height)
+
+        # 9. View Section
+        s9_frame, s9_content = self._create_section("View Options")
 
         y_cursor = -0.02
 
         self._toggle_plates_button = self._create_button(
-            s8_content,
+            s9_content,
             "Show Plates: ON",
             (0, y_cursor),
             self._on_toggle_plates_clicked,
         )
 
-        s8_height = 0.10
-        self._add_section_to_layout(s8_frame, s8_content, s8_height)
+        s9_height = 0.10
+        self._add_section_to_layout(s9_frame, s9_content, s9_height)
 
         # --- BOTTOM PANELS ---
         # Fixed area at bottom for status/map
@@ -612,6 +643,34 @@ class UIManager:
 
         if self._on_toggle_plates:
             self._on_toggle_plates(self._plates_visible)
+
+    def set_paint_elevation_callback(self, callback: Callable):
+        """Set callback for painting elevation map."""
+        self._on_paint_elevation = callback
+
+    def _on_paint_elevation_clicked(self):
+        if self._on_paint_elevation:
+            self._on_paint_elevation()
+
+    def set_toggle_elevation_callback(self, callback: Callable):
+        """Set callback for toggling elevation view."""
+        self._on_toggle_elevation = callback
+
+    def _on_toggle_elevation_clicked(self):
+        self._elevation_visible = not self._elevation_visible
+        label = "ON" if self._elevation_visible else "OFF"
+        self._toggle_elevation_button["text"] = f"Show Elevation: {label}"
+
+        if self._on_toggle_elevation:
+            self._on_toggle_elevation(self._elevation_visible)
+
+    def set_export_callback(self, callback: Callable):
+        """Set callback for exporting maps."""
+        self._on_export = callback
+
+    def _on_export_clicked(self):
+        if self._on_export:
+            self._on_export()
 
     def show_progress(self, visible: bool = True):
         if visible:
