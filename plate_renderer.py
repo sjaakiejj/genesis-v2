@@ -216,7 +216,9 @@ class ThreadedTextureGenerator:
         except Exception as e:
             self._result_queue.put(("error", str(e)))
         finally:
-            self._is_generating = False
+            # Only reset if we are still the active thread
+            if self._thread == threading.current_thread():
+                self._is_generating = False
 
     def _on_progress(self, progress: GenerationProgress):
         """Handle progress updates from generator."""

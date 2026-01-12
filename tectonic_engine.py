@@ -1338,16 +1338,7 @@ class PlateManager:
     ) -> bool:
         """
         Simulate plate movement over multiple time steps.
-
-        Uses the rotation model (from assign_kinematics) to advance plate positions.
-        Each iteration moves plates by time_step_myr million years.
-
-        Args:
-            num_iterations: Number of simulation steps to run
-            time_step_myr: Time step size in millions of years
-
-        Returns:
-            True if simulation was successful, False otherwise
+        Now delegates to step_simulation for each iteration.
         """
         if self.rotation_model is None:
             print("Error: No rotation model. Run assign_kinematics first.")
@@ -1359,36 +1350,95 @@ class PlateManager:
 
         print(f"Simulating {num_iterations} iterations ({time_step_myr} Myr each)...")
 
-        # Track cumulative time
-        # We start at time 0 (present) and move backward in geological time
-        # But for our synthetic model, we treat it as forward motion
         current_time = 0.0
 
         for iteration in range(num_iterations):
-            next_time = current_time + time_step_myr
-
-            for plate in self.plates:
-                try:
-                    # Get stage rotation from current_time to next_time
-                    # In pygplates, stage rotation describes motion from older to younger time
-                    # get_rotation(to_time, plate_id, from_time, anchor_id)
-                    stage_rotation = self.rotation_model.get_rotation(
-                        current_time, plate.plate_id, next_time, 9999
-                    )
-                except pygplates.InformationModelError:
-                    # Plate not in rotation model, skip
-                    continue
-
-                # Rotate plate data
-                self._rotate_plate(plate, stage_rotation)
-
-            current_time = next_time
+            current_time = self.step_simulation(current_time, time_step_myr)
             print(
                 f"  Iteration {iteration + 1}/{num_iterations} complete (t={current_time:.1f} Myr)"
             )
 
         print(f"Simulation complete. Total time: {current_time:.1f} Myr")
         return True
+
+    def step_simulation(self, current_time: float, time_step_myr: float) -> float:
+        """
+        Run a single simulation step. Returns the new current time.
+
+        Note on rotation model: Our rotation model only defines rotations at t=0 (identity)
+        and t=1 (one Myr of motion). Since we're applying incremental rotations to
+        already-rotated geometry, we always request the stage rotation from 0 to time_step_myr.
+        This gives us the consistent rotation rate defined in the model, which we then
+        apply repeatedly to accumulate motion over many steps.
+        """
+        next_time = current_time + time_step_myr
+
+        for plate in self.plates:
+            try:
+                # Always get the stage rotation from 0 to time_step_myr
+                # This gives us the consistent per-step rotation defined in the model.
+                # We apply this incrementally to geometry that's already been rotated.
+                stage_rotation = self.rotation_model.get_rotation(
+                    0.0, plate.plate_id, time_step_myr, 9999
+                )
+            except pygplates.InformationModelError:
+                # Plate not in rotation model, skip
+                continue
+
+            # Rotate plate data
+            self._rotate_plate(plate, stage_rotation)
+
+        return next_time
+
+    def get_render_snapshot(self) -> List[PlateData]:
+        """
+        Create a deep copy of the current plate state for rendering.
+        This allows rendering to happen safely while simulation continues in a background thread.
+        """
+        snapshot = []
+        for plate in self.plates:
+            # Create a new PlateData instance with copied mutable fields
+            # We shallow copy the object then manually deep copy needed arrays
+
+            # Vertices: numpy array copy
+            vertices_copy = (
+                plate.vertices.copy() if plate.vertices is not None else None
+            )
+
+            # Centroid: numpy array copy
+            centroid_copy = (
+                plate.centroid.copy() if plate.centroid is not None else None
+            )
+
+            # Velocity: numpy array copy
+            velocity_copy = (
+                plate.velocity_vector.copy()
+                if plate.velocity_vector is not None
+                else None
+            )
+
+            # Seed Point: numpy array copy
+            seed_copy = (
+                plate.seed_point.copy() if plate.seed_point is not None else None
+            )
+
+            new_plate = PlateData(
+                plate_id=plate.plate_id,
+                seed_point=seed_copy,
+                vertices=vertices_copy,
+                color=plate.color,
+                boundary_polygon=plate.boundary_polygon,  # Safe because immutable & replaced on update
+                neighbors=list(plate.neighbors),  # New list
+                centroid=centroid_copy,
+                velocity_vector=velocity_copy,
+                rotation_pole=plate.rotation_pole,  # Reference is fine
+                crust_type=plate.crust_type,  # Enum/Immutable
+                continent_polygon=plate.continent_polygon,  # Safe
+                feature=plate.feature,
+            )
+            snapshot.append(new_plate)
+
+        return snapshot
 
     def _rotate_plate(self, plate: PlateData, rotation: "pygplates.FiniteRotation"):
         """
@@ -1482,39 +1532,83 @@ class PlateManager:
         """
         result_polys = []
 
+        """
+        Rotate a Shapely MultiPolygon using a pygplates FiniteRotation.
+        Coordinates are (lon, lat).
+        Handles dateline wrapping by splitting polygons.
+        """
+        result_polys = []
+
         for poly in multipoly.geoms:
-            # Rotate exterior ring
-            exterior_coords = list(poly.exterior.coords)
-            rotated_exterior = []
+            # 1. Rotate exterior ring
+            rotated_exterior = self._rotate_ring(list(poly.exterior.coords), rotation)
+            if not rotated_exterior:
+                continue
 
-            for lon, lat in exterior_coords:
-                point = pygplates.PointOnSphere(lat, lon)
-                rotated_point = rotation * point
-                rot_lat, rot_lon = rotated_point.to_lat_lon()
-                rotated_exterior.append((rot_lon, rot_lat))
-
-            # Handle interior rings (holes)
+            # 2. Handle interior rings (holes) -- simplified: ignoring holes if they wrap badly for now
+            # To do this properly we'd need to shift/clip holes alongside the exterior
+            # For this version, we'll carry holes if they are simple, else skip
             rotated_interiors = []
             for interior in poly.interiors:
-                interior_coords = list(interior.coords)
-                rotated_interior = []
-                for lon, lat in interior_coords:
-                    point = pygplates.PointOnSphere(lat, lon)
-                    rotated_point = rotation * point
-                    rot_lat, rot_lon = rotated_point.to_lat_lon()
-                    rotated_interior.append((rot_lon, rot_lat))
-                rotated_interiors.append(rotated_interior)
+                rot_int = self._rotate_ring(list(interior.coords), rotation)
+                if rot_int:
+                    rotated_interiors.append(rot_int)
 
-            # Create rotated polygon
-            rotated_poly = Polygon(rotated_exterior, rotated_interiors)
+            # 3. Create polygon from unwrapped coordinates
+            try:
+                # Use just the exterior for splitting/wrapping logic as holes are tricky
+                # Ideally we'd keep holes, but splitting a polygon with holes across dateline is complex
+                # We'll try to keep holes if they exist in the primary unwrapped poly
+                unwrapped_poly = Polygon(rotated_exterior, rotated_interiors)
+            except:
+                # Fallback: ignore holes if invalid
+                unwrapped_poly = Polygon(rotated_exterior)
 
-            if not rotated_poly.is_valid:
-                rotated_poly = rotated_poly.buffer(0)
+            if not unwrapped_poly.is_valid:
+                unwrapped_poly = unwrapped_poly.buffer(0)
 
-            if not rotated_poly.is_empty:
-                if isinstance(rotated_poly, Polygon):
-                    result_polys.append(rotated_poly)
-                elif isinstance(rotated_poly, MultiPolygon):
-                    result_polys.extend(rotated_poly.geoms)
+            # 4. Split across dateline using shift+clip approach
+            # Create copies shifted by -360, 0, +360
+            for shift in [-360.0, 0.0, 360.0]:
+                shifted_poly = self._shift_polygon(unwrapped_poly, shift)
+                try:
+                    clipped = clip_by_rect(shifted_poly, -180.0, -90.0, 180.0, 90.0)
+                    if not clipped.is_empty:
+                        if isinstance(clipped, Polygon):
+                            result_polys.append(clipped)
+                        elif isinstance(clipped, MultiPolygon):
+                            result_polys.extend(clipped.geoms)
+                except Exception:
+                    pass
 
         return MultiPolygon(result_polys) if result_polys else multipoly
+
+    def _rotate_ring(
+        self, coords: List[Tuple[float, float]], rotation: "pygplates.FiniteRotation"
+    ) -> List[Tuple[float, float]]:
+        """Rotate a ring of coordinates and unwrap longitude."""
+        rotated_coords = []
+        for lon, lat in coords:
+            point = pygplates.PointOnSphere(lat, lon)
+            rotated_point = rotation * point
+            rot_lat, rot_lon = rotated_point.to_lat_lon()
+            rotated_coords.append((rot_lon, rot_lat))
+
+        if not rotated_coords:
+            return []
+
+        # Unwrap longitudes
+        unwrapped = [rotated_coords[0]]
+        for i in range(1, len(rotated_coords)):
+            prev_lon, prev_lat = unwrapped[-1]
+            curr_lon, curr_lat = rotated_coords[i]
+
+            delta_lon = curr_lon - prev_lon
+            if delta_lon > 180.0:
+                curr_lon -= 360.0
+            elif delta_lon < -180.0:
+                curr_lon += 360.0
+
+            unwrapped.append((curr_lon, curr_lat))
+
+        return unwrapped

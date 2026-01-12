@@ -19,6 +19,9 @@ from panda3d.core import (
 import math
 import numpy as np
 
+import threading
+from queue import Queue
+
 # Local modules
 from tectonic_engine import PlateManager
 from plate_renderer import PlateRenderer
@@ -59,6 +62,10 @@ class TectonicMapGenerator(ShowBase):
         # Generation state
         self._is_generating = False
         self._selection_refresh_pending = False
+        self._simulation_queue = Queue()  # Queue for simulation updates
+        self._simulation_time = 0.0  # Cumulative simulation time in Myr
+        self._simulation_active = False  # Track if a simulation thread is running
+        self.taskMgr.add(self._update_simulation_view, "update_simulation_view")
 
         # Setup display regions first
         self._setup_display_regions()
@@ -339,10 +346,11 @@ class TectonicMapGenerator(ShowBase):
             self.last_mouse_x = mouse_x
             self.last_mouse_y = mouse_y
 
-        # Update generation progress
-        if self._is_generating:
-            progress = self.plate_renderer.update()
+        # Always consume texture generation results (prevents queue accumulation)
+        progress = self.plate_renderer.update()
 
+        # Update generation progress UI
+        if self._is_generating:
             if progress:
                 self.ui_manager.update_progress(progress.percentage, progress.message)
 
@@ -534,27 +542,160 @@ class TectonicMapGenerator(ShowBase):
             self.ui_manager.set_status("Error: Assign kinematics first (Step 3)!")
             return
 
-        print(f"Running simulation for {num_iterations} iterations...")
-
-        # Run simulation
-        success = self.plate_manager.simulate_plate_movement(num_iterations)
-
-        if not success:
-            self.ui_manager.set_status("Simulation failed!")
-            return
-
-        # Update velocity vectors display
-        self.plate_renderer.render_velocity_vectors(
-            self.plate_manager.plates, visible=self.ui_manager._vectors_visible
-        )
-
-        # Regenerate texture to show new positions
         self._is_generating = True
+        self._simulation_active = True
         self.ui_manager.set_generating(True)
-        self.ui_manager.set_status("Updating plate positions...")
-        self.plate_renderer.start_plate_generation(
-            self.plate_manager.plates, self.plate_manager.get_selected_ids()
+        self.ui_manager.set_status("Initializing simulation...")
+
+        # Clear any stale messages from previous simulations
+        while not self._simulation_queue.empty():
+            try:
+                self._simulation_queue.get_nowait()
+            except:
+                break
+
+        # Start simulation thread (always starts from local time 0, since
+        # geometry is already in its current rotated state from previous runs)
+        thread = threading.Thread(
+            target=self._simulation_thread_loop,
+            args=(num_iterations, 0.0),  # Always start from 0 - geometry persists
+            daemon=True,
         )
+        thread.start()
+
+    def _simulation_thread_loop(self, num_iterations: int, start_time: float):
+        """Background thread for running simulation steps."""
+        try:
+            current_time = start_time
+            time_step = 1.0
+            update_interval = 10  # Update UI every 10 iterations
+
+            for i in range(num_iterations):
+                # Run single step
+                current_time = self.plate_manager.step_simulation(
+                    current_time, time_step
+                )
+
+                # Report progress
+                iteration = i + 1
+                if iteration % update_interval == 0 or iteration == num_iterations:
+                    # Create snapshot for rendering
+                    snapshot = self.plate_manager.get_render_snapshot()
+
+                    # Send to main thread
+                    self._simulation_queue.put(
+                        {
+                            "type": "update",
+                            "iteration": iteration,
+                            "total": num_iterations,
+                            "time": current_time,
+                            "snapshot": snapshot,
+                        }
+                    )
+
+            # Send complete message with final time
+            self._simulation_queue.put(
+                {
+                    "type": "complete",
+                    "total": num_iterations,
+                    "final_time": current_time,
+                }
+            )
+
+        except Exception as e:
+            print(f"Simulation thread error: {e}")
+            self._simulation_queue.put({"type": "error", "message": str(e)})
+
+    def _update_simulation_view(self, task):
+        """Task to check for simulation updates and refresh renderer."""
+
+        # Only drain the queue if we don't have a pending snapshot waiting to be rendered
+        # This prevents overwriting updates before they get applied
+        has_pending = (
+            hasattr(self, "_pending_snapshot") and self._pending_snapshot is not None
+        )
+
+        latest_update = None
+        complete_msg = None
+        error_msg = None
+
+        while not self._simulation_queue.empty():
+            try:
+                msg = self._simulation_queue.get_nowait()
+                msg_type = msg.get("type")
+
+                if msg_type == "update":
+                    # Only keep this update if we don't already have a pending one
+                    if not has_pending:
+                        latest_update = msg
+                    # Otherwise discard - we'll get the next one after rendering completes
+                elif msg_type == "complete":
+                    complete_msg = msg
+                elif msg_type == "error":
+                    error_msg = msg
+            except:
+                break
+
+        # Handle error first
+        if error_msg:
+            self.ui_manager.set_status(f"Error: {error_msg['message']}")
+            self._is_generating = False
+            self._simulation_active = False
+            self.ui_manager.set_generating(False)
+            self._pending_snapshot = None
+            return Task.cont
+
+        # Handle complete
+        if complete_msg:
+            print("Simulation complete")
+            # Update cumulative simulation time
+            if "final_time" in complete_msg:
+                self._simulation_time = complete_msg["final_time"]
+            self.ui_manager.set_status(
+                f"Simulation complete (t={self._simulation_time:.0f} Myr)"
+            )
+            self._is_generating = False
+            self._simulation_active = False
+            self.ui_manager.set_generating(False)
+            self._pending_snapshot = None
+
+            # Force final texture update with authoritative plate state
+            self.plate_renderer.start_plate_generation(
+                self.plate_manager.plates, self.plate_manager.get_selected_ids()
+            )
+            return Task.cont
+
+        # Store latest update as pending snapshot (only if we don't already have one)
+        if latest_update and not has_pending:
+            self._pending_snapshot = latest_update
+            self.ui_manager.set_status(
+                f"Simulating: {latest_update['iteration']}/{latest_update['total']} (t={latest_update['time']:.0f} Myr)"
+            )
+
+        # Apply pending snapshot if renderer is idle
+        if hasattr(self, "_pending_snapshot") and self._pending_snapshot:
+            if not self.plate_renderer.is_generating():
+                snapshot = self._pending_snapshot["snapshot"]
+                iteration = self._pending_snapshot["iteration"]
+                total = self._pending_snapshot["total"]
+                time = self._pending_snapshot["time"]
+
+                print(
+                    f"Applying simulation update: Iteration {iteration}/{total} (t={time} Myr)"
+                )
+
+                # Update velocity vectors
+                if self.ui_manager._vectors_visible:
+                    self.plate_renderer.render_velocity_vectors(snapshot, visible=True)
+
+                # Trigger texture regeneration
+                self.plate_renderer.start_plate_generation(
+                    snapshot, self.plate_manager.get_selected_ids()
+                )
+
+                self._pending_snapshot = None
+
+        return Task.cont
 
 
 def main():
